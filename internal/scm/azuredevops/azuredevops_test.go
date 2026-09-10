@@ -86,6 +86,39 @@ func TestFindPRReturnsBrowsableURL(t *testing.T) {
 	}
 }
 
+func TestFindPRConstructsURLWhenListOmitsRepositoryWebURL(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		repository string
+	}{
+		{name: "absent", repository: `{"name":"myrepo","project":{"name":"myproject"}}`},
+		{name: "null", repository: `{"name":"myrepo","webUrl":null,"project":{"name":"myproject"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newTestHost(map[string]azdoTestResponse{
+				"az repos pr list --source-branch feature --status active --target-branch main --organization " + testOrg + " --project " + testProject + " --repository " + testRepo + " --output json": {
+					stdout: `[{"pullRequestId":42,"status":"active","repository":` + tc.repository + `}]` + "\n",
+				},
+			})
+
+			pr, err := h.FindPR(context.Background(), "feature", "main")
+			if err != nil {
+				t.Fatalf("FindPR() error = %v", err)
+			}
+			if pr == nil || pr.Number != "42" {
+				t.Fatalf("FindPR() = %+v, want PR 42", pr)
+			}
+			if pr.URL != "https://dev.azure.com/myorg/myproject/_git/myrepo/pullrequest/42" {
+				t.Fatalf("FindPR() URL = %q, want constructed browsable pullrequest URL", pr.URL)
+			}
+		})
+	}
+}
+
 func TestFindPRAcceptsEquivalentOrganizationURLForms(t *testing.T) {
 	t.Parallel()
 
@@ -141,6 +174,24 @@ func TestFindPRIgnoresStderrChatter(t *testing.T) {
 	}
 	if pr == nil || pr.Number != "42" {
 		t.Fatalf("FindPR() = %+v, want PR 42 (stderr chatter must not corrupt JSON)", pr)
+	}
+}
+
+func TestFindPRRejectsMissingPullRequestID(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHost(map[string]azdoTestResponse{
+		"az repos pr list --source-branch feature --status active --target-branch main --organization " + testOrg + " --project " + testProject + " --repository " + testRepo + " --output json": {
+			stdout: `[{"status":"active","repository":{"name":"myrepo","project":{"name":"myproject"}}}]` + "\n",
+		},
+	})
+
+	pr, err := h.FindPR(context.Background(), "feature", "main")
+	if err == nil || !strings.Contains(err.Error(), "missing positive pullRequestId") {
+		t.Fatalf("FindPR() error = %v, want missing positive pullRequestId", err)
+	}
+	if pr != nil {
+		t.Fatalf("FindPR() = %+v, want nil on missing required identity", pr)
 	}
 }
 

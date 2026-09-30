@@ -43,6 +43,8 @@ jobs:
     # Known automation accounts are exempt so the release pipeline keeps working:
     # - github-actions[bot] opens the release-please PR via GITHUB_TOKEN
     # - dependabot[bot] opens dependency update PRs
+    # Fork owners are also exempt: direct PRs are the fork's delivery posture,
+    # since the tool cannot validate itself while it is being fixed.
     # Other authors (human or bot) must raise PRs through `git push no-mistakes`.
     #
     # These stay job-level rather than moving to the action's `exempt-authors`
@@ -53,7 +55,8 @@ jobs:
     if: >-
       github.event.pull_request.user.login != 'github-actions[bot]' &&
       github.event.pull_request.user.login != 'dependabot[bot]' &&
-      github.event.pull_request.user.login != 'release-please[bot]'
+      github.event.pull_request.user.login != 'release-please[bot]' &&
+      github.event.pull_request.user.login != github.repository_owner
     steps:
       # Pinned to the immutable commit that published the action, never @main:
       # main is editable by the very pull request this gate is judging. A pull

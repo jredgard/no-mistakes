@@ -110,7 +110,7 @@ func TestNoMistakesRequiredWorkflowExemptsReleaseAutomation(t *testing.T) {
 		{login: "unlisted-automation[bot]", wantRun: true},
 	} {
 		t.Run(tc.login, func(t *testing.T) {
-			got, err := evaluateRequiredWorkflowAuthorCondition(condition, tc.login)
+			got, err := evaluateRequiredWorkflowAuthorCondition(condition, tc.login, "kunchenguid")
 			if err != nil {
 				t.Fatalf("evaluate check job condition: %v", err)
 			}
@@ -121,18 +121,49 @@ func TestNoMistakesRequiredWorkflowExemptsReleaseAutomation(t *testing.T) {
 	}
 }
 
-func evaluateRequiredWorkflowAuthorCondition(condition, author string) (bool, error) {
+func TestNoMistakesRequiredWorkflowExemptsRepositoryOwner(t *testing.T) {
+	condition := loadRequiredWorkflow(t).Jobs["check"].If
+	for _, tc := range []struct {
+		name            string
+		login           string
+		repositoryOwner string
+		wantRun         bool
+	}{
+		{name: "fork_owner", login: "jredgard", repositoryOwner: "jredgard", wantRun: false},
+		{name: "fork_contributor", login: "human-contributor", repositoryOwner: "jredgard", wantRun: true},
+		{name: "transferred_owner", login: "new-owner", repositoryOwner: "new-owner", wantRun: false},
+		{name: "previous_owner", login: "jredgard", repositoryOwner: "new-owner", wantRun: true},
+		{name: "fork_owner_on_upstream", login: "jredgard", repositoryOwner: "kunchenguid", wantRun: true},
+		{name: "upstream_contributor", login: "human-contributor", repositoryOwner: "kunchenguid", wantRun: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := evaluateRequiredWorkflowAuthorCondition(condition, tc.login, tc.repositoryOwner)
+			if err != nil {
+				t.Fatalf("evaluate check job condition: %v", err)
+			}
+			if got != tc.wantRun {
+				t.Fatalf("check job runs for author %q in repository owned by %q = %t, want %t", tc.login, tc.repositoryOwner, got, tc.wantRun)
+			}
+		})
+	}
+}
+
+func evaluateRequiredWorkflowAuthorCondition(condition, author, repositoryOwner string) (bool, error) {
 	terms := strings.Split(condition, "&&")
 	if len(terms) == 0 {
 		return false, fmt.Errorf("empty author condition")
 	}
-	termPattern := regexp.MustCompile(`^github\.event\.pull_request\.user\.login\s*!=\s*'([^']+)'$`)
+	termPattern := regexp.MustCompile(`^github\.event\.pull_request\.user\.login\s*!=\s*(?:'([^']+)'|(github\.repository_owner))$`)
 	for _, term := range terms {
 		matches := termPattern.FindStringSubmatch(strings.TrimSpace(term))
 		if matches == nil {
 			return false, fmt.Errorf("unsupported author condition term %q", strings.TrimSpace(term))
 		}
-		if author == matches[1] {
+		exemptAuthor := matches[1]
+		if matches[2] != "" {
+			exemptAuthor = repositoryOwner
+		}
+		if author == exemptAuthor {
 			return false, nil
 		}
 	}

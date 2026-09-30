@@ -78,6 +78,8 @@ func handleFakeCLI(mode string) {
 		fakeCIGlabHandler(args)
 	case "ci-glab-seq":
 		fakeCIGlabSequenceHandler(args)
+	case "ci-az":
+		fakeCIAzureDevOpsHandler(args)
 	case "ci-gh-reconcile":
 		fakeCIGHReconcileHandler(args)
 	case "ci-gh-with-intervening-push":
@@ -92,6 +94,23 @@ func handleFakeCLI(mode string) {
 			fakeCIGHHandler(args)
 		}
 	default:
+		os.Exit(1)
+	}
+}
+
+func fakeCIAzureDevOpsHandler(args []string) {
+	joined := strings.Join(args, " ")
+	switch {
+	case strings.HasPrefix(joined, "extension show --name azure-devops"):
+		fmt.Println("{}")
+	case strings.HasPrefix(joined, "devops project list"):
+		fmt.Println("project-id")
+	case strings.HasPrefix(joined, "repos pr policy list"):
+		fmt.Println(os.Getenv("FAKE_CLI_CHECKS"))
+	case strings.HasPrefix(joined, "repos pr show"):
+		fmt.Printf(`{"pullRequestId":42,"status":"active","mergeStatus":%q,"targetRefName":"refs/heads/main"}`+"\n", os.Getenv("FAKE_CLI_MERGEABLE"))
+	default:
+		fmt.Fprintln(os.Stderr, "unexpected Azure DevOps command: "+joined)
 		os.Exit(1)
 	}
 }

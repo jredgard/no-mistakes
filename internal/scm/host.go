@@ -193,7 +193,8 @@ type Check struct {
 	// is a wait on a maintainer rather than a verdict on the code: such a
 	// check is reported pending, never failing, so the CI step waits for the
 	// approval instead of spending auto-fix rounds on work that never ran.
-	AwaitingApproval bool
+	AwaitingApproval     bool
+	UnstartedPolicyBuild bool
 	// App identifies the provider application that published the check, when
 	// the provider reports one: on GitHub it is the check suite's app slug
 	// ("github-actions" for every Actions job, "greptile-apps" for Greptile's

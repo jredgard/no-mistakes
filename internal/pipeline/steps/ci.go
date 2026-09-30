@@ -561,7 +561,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 			// rerun policy, even though it is not a verdict on the code. A
 			// check held for maintainer approval will not finish on its own,
 			// so it does not defer the other checks' issues.
-			checksPending := hasExecutingPendingChecks(checks)
+			checksPending := hasExecutingPendingChecks(checks, mergeConflict)
 			// readinessPending is deliberately broader: any state that is not a
 			// conclusive pass, failure, or skip must keep the PR non-ready. This
 			// includes cancelled, held, and unknown provider states.

@@ -49,12 +49,12 @@ func hasPendingChecks(checks []scm.Check) bool {
 }
 
 // hasExecutingPendingChecks returns true if any CI check is still running or
-// queued on its own. A check the provider holds for maintainer approval is
-// pending but will not finish without a human, so it never defers escalation
-// of the other checks' failures.
-func hasExecutingPendingChecks(checks []scm.Check) bool {
+// queued on its own. Maintainer approval holds never defer escalation. During
+// a merge conflict, an Azure DevOps policy build queued without a build ID
+// cannot run until the conflict is repaired, so it does not defer that repair.
+func hasExecutingPendingChecks(checks []scm.Check, mergeConflict bool) bool {
 	for _, c := range checks {
-		if c.Pending() && !c.AwaitingApproval {
+		if c.Pending() && !c.AwaitingApproval && !(mergeConflict && c.UnstartedPolicyBuild) {
 			return true
 		}
 	}

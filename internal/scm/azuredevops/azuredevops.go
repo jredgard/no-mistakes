@@ -373,10 +373,11 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 			providerID = "azure-policy-evaluation:" + id
 		}
 		checks = append(checks, scm.Check{
-			Name:        e.checkName(),
-			ProviderID:  providerID,
-			Bucket:      bucket,
-			CompletedAt: parseAzTime(e.CompletedDate),
+			Name:                 e.checkName(),
+			ProviderID:           providerID,
+			Bucket:               bucket,
+			CompletedAt:          parseAzTime(e.CompletedDate),
+			UnstartedPolicyBuild: e.isUnstartedBuild(),
 		})
 	}
 	return checks, nil

@@ -62,6 +62,23 @@ func (e policyEval) isCICheck() bool {
 	}
 }
 
+func (e policyEval) isUnstartedBuild() bool {
+	if !strings.EqualFold(strings.TrimSpace(e.Configuration.Type.DisplayName), "build") ||
+		!strings.EqualFold(strings.TrimSpace(e.Status), "queued") {
+		return false
+	}
+	switch buildID := e.Context["buildId"].(type) {
+	case nil:
+		return true
+	case float64:
+		return buildID == 0
+	case string:
+		return strings.TrimSpace(buildID) == "0"
+	default:
+		return false
+	}
+}
+
 // checkName derives a human-readable check name, preferring the policy's
 // configured display name, then the triggered build definition name, then the
 // policy type.

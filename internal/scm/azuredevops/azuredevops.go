@@ -167,12 +167,13 @@ func (h *Host) validateListedPR(candidate azPR) error {
 	if candidate.PullRequestID <= 0 {
 		return errors.New("missing positive pullRequestId")
 	}
-	// Some az CLI versions omit repository.webUrl from `repos pr list` even
-	// though `repos pr show` includes it. FindPR does not need that field: the
-	// list command is already scoped to h's org/project/repo, and toPR builds
-	// the browsable URL from that trusted scope. When az does return webUrl,
-	// keep validating it strictly so contradictory repository data fails closed.
-	if strings.TrimSpace(candidate.Repository.WebURL) != "" {
+	// az repos pr list often omits repository.webUrl (null in list payloads;
+	// the show endpoint supplies it). Organization is already pinned by the
+	// list command's --organization flag, so a missing URL is identified by
+	// repository.name and repository.project.name instead of a second show
+	// call. A nonempty URL is still parsed and must match; names never
+	// rescue a malformed URL.
+	if candidate.Repository.WebURL != "" {
 		org, project, repo, err := parseRepositoryWebURL(candidate.Repository.WebURL)
 		if err != nil {
 			return err
@@ -186,12 +187,27 @@ func (h *Host) validateListedPR(candidate azPR) error {
 		if !strings.EqualFold(repo, h.repo) {
 			return fmt.Errorf("repository name %q does not match configured repository %q", repo, h.repo)
 		}
+		if name := strings.TrimSpace(candidate.Repository.Name); name != "" && !strings.EqualFold(name, h.repo) {
+			return fmt.Errorf("repository metadata name %q does not match configured repository %q", name, h.repo)
+		}
+		if name := strings.TrimSpace(candidate.Repository.Project.Name); name != "" && !strings.EqualFold(name, h.project) {
+			return fmt.Errorf("repository metadata project %q does not match configured project %q", name, h.project)
+		}
+		return nil
 	}
-	if name := strings.TrimSpace(candidate.Repository.Name); name != "" && !strings.EqualFold(name, h.repo) {
-		return fmt.Errorf("repository metadata name %q does not match configured repository %q", name, h.repo)
+	repo := strings.TrimSpace(candidate.Repository.Name)
+	if repo == "" {
+		return errors.New("missing repository.name")
 	}
-	if name := strings.TrimSpace(candidate.Repository.Project.Name); name != "" && !strings.EqualFold(name, h.project) {
-		return fmt.Errorf("repository metadata project %q does not match configured project %q", name, h.project)
+	if !strings.EqualFold(repo, h.repo) {
+		return fmt.Errorf("repository metadata name %q does not match configured repository %q", repo, h.repo)
+	}
+	project := strings.TrimSpace(candidate.Repository.Project.Name)
+	if project == "" {
+		return errors.New("missing repository.project.name")
+	}
+	if !strings.EqualFold(project, h.project) {
+		return fmt.Errorf("repository metadata project %q does not match configured project %q", project, h.project)
 	}
 	return nil
 }
@@ -308,9 +324,9 @@ func (h *Host) UpdatePR(ctx context.Context, pr *scm.PR, content scm.PRContent) 
 		return nil, errors.New("az repos pr update: missing PR id")
 	}
 	if _, err := h.runWithDescription(ctx, content.Body, func(descArg string) []string {
-		args := []string{"repos", "pr", "update", "--id", id,
-			"--title", content.Title,
-			"--description", descArg,
+		args := []string{"repos", "pr", "update", "--id", id, "--description", descArg}
+		if content.Title != "" {
+			args = append(args, "--title", content.Title)
 		}
 		args = append(args, h.orgArgs()...)
 		return append(args, "--output", "json")

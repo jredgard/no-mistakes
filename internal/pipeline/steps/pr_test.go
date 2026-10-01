@@ -848,7 +848,7 @@ func TestPRStep_UsesAgentGeneratedTitleAndBody(t *testing.T) {
 	if !strings.Contains(ghLog, "keep branch status readable") {
 		t.Fatalf("expected generated PR body in gh call, got:\n%s", ghLog)
 	}
-	if !strings.Contains(ghLog, "fix footer truncation\n\n## Risk Assessment\n\n⚠️ Medium: touches critical error handling") {
+	if !strings.Contains(ghLog, "fix footer truncation\n\n"+prGeneratorLine+"\n\n## Risk Assessment\n\n⚠️ Medium: touches critical error handling") {
 		t.Fatalf("expected risk note under Risk Assessment heading, got:\n%s", ghLog)
 	}
 	if strings.Contains(ghLog, "--title feature") {
@@ -918,12 +918,8 @@ func TestPRStep_AppendsTestingSectionFromTestStep(t *testing.T) {
 	if !strings.Contains(ghLog, wantOrder) {
 		t.Fatalf("expected testing section between risk assessment and pipeline, got:\n%s", ghLog)
 	}
-	// Regression guard (#605/firstmate #1577, #1609): the Pipeline section
-	// must carry the rich per-step fix detail (BuildPipelineSummary), not the
-	// compact status-only variant (BuildPipelineStatusSummary) whose
-	// <details> body is always empty and would never show this finding line.
-	if !strings.Contains(ghLog, "expected 429 got 200") {
-		t.Fatalf("expected rich per-step Pipeline detail with the Test step's finding, got:\n%s", ghLog)
+	if !strings.Contains(ghLog, "- ⚠️ test - 1 issue found → fix attempted; result not reported ✅") {
+		t.Fatalf("expected per-step Pipeline issue summary, got:\n%s", ghLog)
 	}
 }
 
@@ -1513,7 +1509,7 @@ func TestBuildPRBody_TruncatesOversizedIntentBeforeGeneratedSections(t *testing.
 	for _, want := range []string{
 		"## Intent",
 		"Keep generated sections visible.",
-		"body truncated to keep the PR body within GitHub's 65536-char limit",
+		fullIntentCommentNote,
 		"## What Changed",
 		"essential summary survives",
 		"## Risk Assessment",
@@ -1541,6 +1537,8 @@ func TestPRStep_CreateKeepsGeneratedSectionsAfterOversizedIntent(t *testing.T) {
 	}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = env
+	bodyFile := filepath.Join(t.TempDir(), "pr-body.md")
+	sctx.Env = append(sctx.Env, "FAKE_CLI_PR_BODY_FILE="+bodyFile)
 	sctx.UserIntent = "Keep generated sections visible.\n" + strings.Repeat("oversized intent context line\n", 2500)
 
 	reviewFindings := `{"findings":[],"summary":"clean","risk_level":"medium","risk_rationale":"validates generated PR body length handling"}`
@@ -1574,7 +1572,18 @@ func TestPRStep_CreateKeepsGeneratedSectionsAfterOversizedIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	body := readFakeGHBodyArg(t, logFile)
+	bodyBytes, err := os.ReadFile(bodyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(bodyBytes)
+	logBytes, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logBytes), "stdin --comment ## Full intent\n\n"+sctx.UserIntent) {
+		t.Fatal("full original intent was not posted after creation")
+	}
 	assertGitHubBodyLimitForTest(t, body)
 	attestation := parsePipelineAttestationForTest(t, body)
 	if attestation.HeadSHA != headSHA {
@@ -1583,7 +1592,7 @@ func TestPRStep_CreateKeepsGeneratedSectionsAfterOversizedIntent(t *testing.T) {
 	for _, want := range []string{
 		"## Intent",
 		"Keep generated sections visible.",
-		"body truncated to keep the PR body within GitHub's 65536-char limit",
+		fullIntentCommentNote,
 		"## What Changed",
 		"essential summary survives",
 		"## Risk Assessment",
@@ -1638,14 +1647,14 @@ func TestPRStep_BuildPRContentTruncatesGeneratedPipelineUpdates(t *testing.T) {
 	if !strings.Contains(content.Body, "Keep PR creation postable") || !strings.Contains(content.Body, "essential summary survives") {
 		t.Fatalf("expected intent and summary to survive, got:\n%s", content.Body)
 	}
-	if !strings.Contains(content.Body, "earlier update rounds omitted") {
-		t.Fatalf("expected omission marker, got:\n%s", content.Body)
+	if !strings.Contains(content.Body, "- ⚠️ review - 1 issue found → fix attempted; result not reported (139) ✅") {
+		t.Fatalf("expected bounded step summary, got:\n%s", content.Body)
 	}
 	if strings.Contains(content.Body, "review round 001") {
 		t.Fatalf("expected old pipeline update to be omitted, got:\n%s", content.Body)
 	}
-	if !strings.Contains(content.Body, "review round 140") {
-		t.Fatalf("expected latest pipeline update to be retained, got:\n%s", content.Body)
+	if strings.Contains(content.Body, "review round 140") {
+		t.Fatalf("detailed review rounds belong outside compact Pipeline rows:\n%s", content.Body)
 	}
 }
 
@@ -1701,8 +1710,7 @@ func TestPRStep_CreateCapsBodyAfterPrependedIntent(t *testing.T) {
 		"Keep PR creation postable.",
 		"intent context line stays visible",
 		"essential summary survives",
-		"earlier update rounds omitted",
-		"review round 140",
+		"- ⚠️ review - 1 issue found → fix attempted; result not reported (139) ✅",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected final PR body to contain %q", want)
@@ -2219,7 +2227,7 @@ func TestPRStep_AgentNonConventionalTitleFallsBack(t *testing.T) {
 		t.Fatal("expected user-facing agent title to be prefixed with fix:, got: " + ghLog)
 	}
 	// The agent's body should be preserved, not replaced with fallback
-	if !strings.Contains(ghLog, "## Summary") {
+	if !strings.Contains(ghLog, "## What Changed\n\n- improvements") {
 		t.Fatal("expected agent body to be preserved, got: " + ghLog)
 	}
 }
@@ -2616,7 +2624,7 @@ func TestPRStep_ForeignAttestationsInEveryComponentDoNotShadowTheRealOne(t *test
 		}},
 	}), "")
 
-	content, err := (&PRStep{}).buildPRContent(sctx, "feature", "main", baseSHA, scm.ProviderGitHub, 0)
+	content, err := (&PRStep{}).buildPRContent(sctx, "feature", "main", baseSHA, scm.ProviderGitLab, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

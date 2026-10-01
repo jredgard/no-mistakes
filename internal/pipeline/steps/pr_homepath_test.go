@@ -363,6 +363,11 @@ func buildHomePathLeakPRContent(t *testing.T, tc homePathLeakCase) prContent {
 
 func buildHomePathLeakPRContentWithLimit(t *testing.T, tc homePathLeakCase, bodyLimit int) prContent {
 	t.Helper()
+	return buildHomePathLeakPRContentFor(t, tc, bodyLimit, scm.ProviderGitLab)
+}
+
+func buildHomePathLeakPRContentFor(t *testing.T, tc homePathLeakCase, bodyLimit int, provider scm.Provider) prContent {
+	t.Helper()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 
 	title := tc.agentTitle
@@ -417,7 +422,7 @@ func buildHomePathLeakPRContentWithLimit(t *testing.T, tc homePathLeakCase, body
 		insertCompletedStep(t, sctx, types.StepTest, testFindings, tc.testStepError)
 	}
 
-	content, err := (&PRStep{}).buildPRContent(sctx, "feature", "main", baseSHA, scm.ProviderGitHub, bodyLimit)
+	content, err := (&PRStep{}).buildPRContent(sctx, "feature", "main", baseSHA, provider, bodyLimit)
 	if err != nil {
 		t.Fatal(err)
 	}

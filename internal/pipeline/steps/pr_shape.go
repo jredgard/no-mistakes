@@ -15,8 +15,12 @@ import (
 const prGeneratorLine = "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
 const fullIntentCommentNote = "Full intent is in the first PR comment."
 
+func normalizePRLineEndings(text string) string {
+	return strings.ReplaceAll(text, "\r\n", "\n")
+}
+
 func legacyWhatChanged(body string) string {
-	body = strings.TrimSpace(stripGeneratedSections(body))
+	body = strings.TrimSpace(stripGeneratedSections(normalizePRLineEndings(body)))
 	body = strings.TrimSpace(strings.ReplaceAll(body, prGeneratorLine, ""))
 	if strings.HasPrefix(body, "## Summary") {
 		body = strings.Replace(body, "## Summary", "## What Changed", 1)

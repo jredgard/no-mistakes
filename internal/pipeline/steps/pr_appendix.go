@@ -122,6 +122,9 @@ func assemblePRBody(sctx *pipeline.StepContext, whatChanged, riskLine, testingMD
 	}
 	if provider == scm.ProviderAzureDevOps || provider == scm.ProviderGitHub {
 		whatChanged = legacyWhatChanged(whatChanged)
+		riskLine = normalizePRLineEndings(riskLine)
+		testingMD = normalizePRLineEndings(testingMD)
+		pipelineMD = normalizePRLineEndings(pipelineMD)
 	}
 	switch appendixMode(sctx) {
 	case config.PRAppendixMinimal:
@@ -162,6 +165,9 @@ func buildPRBody(body, riskLine, testingMD, pipelineMD string, sctx *pipeline.St
 	}
 	if provider == scm.ProviderAzureDevOps || provider == scm.ProviderGitHub {
 		body = legacyWhatChanged(body)
+		riskLine = normalizePRLineEndings(riskLine)
+		testingMD = normalizePRLineEndings(testingMD)
+		pipelineMD = normalizePRLineEndings(pipelineMD)
 	}
 	switch appendixMode(sctx) {
 	case config.PRAppendixMinimal:

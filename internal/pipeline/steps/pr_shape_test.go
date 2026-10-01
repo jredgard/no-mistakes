@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -19,7 +20,7 @@ import (
 
 func TestPRDescriptionV184Golden(t *testing.T) {
 	t.Parallel()
-	golden, err := os.ReadFile("testdata/pr-v1.84.0.md")
+	golden, err := os.ReadFile(filepath.Join("testdata", "pr-v1.84.0.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,11 +57,42 @@ func TestPRDescriptionV184Golden(t *testing.T) {
 				}
 			}
 			pipelineMD, risk, _ := (&PRStep{}).buildPipelineSection(sctx, provider)
-			got := assemblePRBody(sctx, "## What Changed\n\n- Declare the concrete quotation detail response schema.\n- Verify the generated OpenAPI response contract.", risk, "", pipelineMD, scm.MaxPRBodyChars(provider), provider)
-			if got+"\n" != string(golden) {
-				t.Fatalf("description differs from v1.84.0 public shape:\n%s", got)
+			for _, ending := range []struct{ name, value string }{{"LF", "\n"}, {"CRLF", "\r\n"}} {
+				t.Run(ending.name, func(t *testing.T) {
+					narrative := strings.ReplaceAll("## What Changed\n\n- Declare the concrete quotation detail response schema.\n- Verify the generated OpenAPI response contract.", "\n", ending.value)
+					pipelineText := strings.ReplaceAll(pipelineMD, "\n", ending.value)
+					want := strings.ReplaceAll(string(golden), "\r\n", "\n")
+					got := assemblePRBody(sctx, narrative, risk, "", pipelineText, scm.MaxPRBodyChars(provider), provider)
+					if got+"\n" != want || strings.Contains(got, "\r") {
+						t.Fatalf("description differs from v1.84.0 public shape:\n%s", got)
+					}
+					got = buildPRBody(narrative, risk, "", pipelineText, sctx, provider)
+					if got+"\n" != want || strings.Contains(got, "\r") {
+						t.Fatalf("byte-budgeted description differs from v1.84.0 public shape:\n%s", got)
+					}
+				})
 			}
 		})
+	}
+}
+
+func TestPRDescriptionNormalizesRecordedSectionLineEndings(t *testing.T) {
+	t.Parallel()
+	sctx := &pipeline.StepContext{UserIntent: "Keep permissions.\r\nKeep record scope."}
+	for _, provider := range []scm.Provider{scm.ProviderAzureDevOps, scm.ProviderGitHub} {
+		for _, body := range []string{
+			assemblePRBody(sctx, "## What Changed\r\n\r\n- Declare response.\r\n- Verify contract.", "✅ Low: Safe.\r\nPermissions unchanged.", "## Testing\r\n\r\n- Contract passed.", "## Pipeline\r\n\r\n- ✅ review - passed", scm.MaxPRBodyChars(provider), provider),
+			buildPRBody("## What Changed\r\n\r\n- Declare response.\r\n- Verify contract.", "✅ Low: Safe.\r\nPermissions unchanged.", "## Testing\r\n\r\n- Contract passed.", "## Pipeline\r\n\r\n- ✅ review - passed", sctx, provider),
+		} {
+			if strings.Contains(body, "\r") {
+				t.Fatalf("%s description contains CRLF: %q", provider, body)
+			}
+			for _, want := range []string{"Keep permissions.\nKeep record scope.", "- Declare response.\n- Verify contract.", "✅ Low: Safe.\nPermissions unchanged.", "## Testing\n\n- Contract passed.", "## Pipeline\n\n- ✅ review - passed"} {
+				if !strings.Contains(body, want) {
+					t.Fatalf("%s description lost %q: %q", provider, want, body)
+				}
+			}
+		}
 	}
 }
 

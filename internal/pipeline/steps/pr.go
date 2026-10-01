@@ -151,6 +151,9 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 					return nil, err
 				}
 			}
+			if title == "" && len(runWorkItems(sctx)) > 0 {
+				title = runWorkItemTitle(sctx, live.Title)
+			}
 			appendix, err := s.buildPRAppendix(sctx, provider)
 			if err != nil {
 				return nil, err
@@ -161,12 +164,18 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			if err := updateOwnedPR(sctx, host, existing, live, title, emptyNarrative, appendix, bodyLimit); err != nil {
 				return nil, err
 			}
+			if err := publishPRReferences(sctx, host, existing, live.Body); err != nil {
+				return nil, err
+			}
 		} else {
 			content, err := s.buildPRContent(sctx, branch, baseBranch, baseSHA, provider, bodyLimit)
 			if err != nil {
 				return nil, err
 			}
 			if err := retargetExistingPRIfNeeded(sctx, host, existing, runPRBaseBranch(sctx)); err != nil {
+				return nil, err
+			}
+			if err := publishPRReferences(sctx, host, existing, content.Body); err != nil {
 				return nil, err
 			}
 			updated, err = host.UpdatePR(ctx, existing, scm.PRContent(content))
@@ -204,6 +213,9 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	sctx.Log(fmt.Sprintf("created pull request: %s", created.URL))
 	if err := sctx.DB.UpdateRunPRURL(sctx.Run.ID, created.URL); err != nil {
 		slog.Warn("failed to persist PR URL", "run", sctx.Run.ID, "url", created.URL, "err", err)
+	}
+	if err := publishPRReferences(sctx, host, created, content.Body); err != nil {
+		return nil, err
 	}
 	if template != "" {
 		reader, ok := host.(scm.PRContentReader)
@@ -557,7 +569,7 @@ func prTitleScopeRules(sctx *pipeline.StepContext) string {
 
 func renderPRTitle(sctx *pipeline.StepContext, title string) (string, error) {
 	if sctx == nil || sctx.Config == nil || sctx.Config.PR.TitleFormat == "" {
-		return conventional.TightenTitle(title), nil
+		return runWorkItemTitle(sctx, conventional.TightenTitle(title)), nil
 	}
 	branch := strings.TrimSpace(strings.TrimPrefix(sctx.Run.Branch, "refs/heads/"))
 	if sctx.Config.PR.RequiresBranch() {
@@ -567,7 +579,8 @@ func renderPRTitle(sctx *pipeline.StepContext, title string) (string, error) {
 			return "", fmt.Errorf("resolve branch identifier for PR title: %w", err)
 		}
 	}
-	return sctx.Config.PR.RenderTitle(branch, title)
+	rendered, err := sctx.Config.PR.RenderTitle(branch, title)
+	return runWorkItemTitle(sctx, rendered), err
 }
 
 // buildPipelineSection queries step results and rounds from the DB and
@@ -600,6 +613,12 @@ func (s *PRStep) buildPipelineSectionFor(sctx *pipeline.StepContext, provider sc
 		policy.AllowTestCommandOverride = strings.TrimSpace(sctx.Config.Test.AllowApproveOverFailure)
 	}
 	pipelineMD, riskLine = buildPipelineSummaryFor(steps, rounds, sctx.Run.HeadSHA, provider, policy)
+	if !owned && (provider == scm.ProviderAzureDevOps || provider == scm.ProviderGitHub) {
+		pipelineMD = legacyPipelineSummary(steps, rounds, sctx.Run.HeadSHA, policy)
+		if riskLine == "" {
+			riskLine = "⚠️ Unknown: no recorded review risk assessment is available."
+		}
+	}
 	// The review conversation rides inside the Pipeline section as an ordinary
 	// `### ` group, so the existing body-budget logic can drop it whole rather
 	// than competing with the attestation it must never displace.
@@ -647,25 +666,34 @@ func prBodyBudgetPromptSection(bodyLimit int) string {
 	return fmt.Sprintf("\n\n- This repository's host caps the entire PR description at %d characters. The Intent, Risk Assessment, and Pipeline sections are appended automatically; a Testing section is included when budget allows. Keep the \"## What Changed\" section to a few short bullet points.", bodyLimit)
 }
 
-// assemblePRBody composes the final PR body from its sections and keeps it
-// within bodyLimit (0 = unlimited). When the full body overruns the cap it
-// first drops the Testing section - the only one that embeds artifact and log
-// file contents and is therefore effectively unbounded - so the body sheds
-// log dumps while keeping its Intent, What Changed, Risk, and Pipeline
-// narrative intact. prependIntentSectionWithinLimit is the final backstop
-// when even that core overruns.
-func assemblePRBodyFull(sctx *pipeline.StepContext, whatChanged, riskLine, testingMD, pipelineMD string, bodyLimit int) string {
+// assemblePRBodyFull reserves the generated sections before compacting Intent
+// at sentence boundaries. Testing embeds are shed only when those sections
+// cannot fit on their own; the core section headings and attestation survive.
+func assemblePRBodyFull(sctx *pipeline.StepContext, whatChanged, riskLine, testingMD, pipelineMD string, bodyLimit int, provider scm.Provider) string {
 	sections := appendGeneratedSections(whatChanged, riskLine, testingMD, pipelineMD)
 	full := prependIntentSection(sections, sctx)
 	if bodyLimit <= 0 || scm.PRBodyLen(full) <= bodyLimit {
 		return full
 	}
+	legacy := provider == scm.ProviderAzureDevOps || provider == scm.ProviderGitHub
+	if legacy {
+		compacted := fitPRIntent(sctx, sections, bodyLimit, scm.PRBodyLen)
+		if scm.PRBodyLen(compacted) <= bodyLimit {
+			return compacted
+		}
+	}
 	if testingMD != "" {
 		sections = appendGeneratedSections(whatChanged, riskLine, "", pipelineMD)
 		core := prependIntentSection(sections, sctx)
+		if legacy {
+			core = fitPRIntent(sctx, sections, bodyLimit, scm.PRBodyLen)
+		}
 		if scm.PRBodyLen(core) <= bodyLimit {
 			return core
 		}
+	}
+	if legacy {
+		return fitPRCore(sctx, whatChanged, riskLine, pipelineMD, bodyLimit)
 	}
 	return assemblePRBodyCoreWithinLimit(sctx, whatChanged, riskLine, pipelineMD, bodyLimit)
 }
@@ -721,8 +749,31 @@ func appendGeneratedSections(body, riskLine, testingMD, pipelineMD string) strin
 	return appendGeneratedSectionsToCleanBody(body, riskLine, testingMD, pipelineMD)
 }
 
-func buildPRBodyFull(body, riskLine, testingMD, pipelineMD string, sctx *pipeline.StepContext, maxBytes int) string {
+func buildPRBodyFull(body, riskLine, testingMD, pipelineMD string, sctx *pipeline.StepContext, maxBytes int, provider scm.Provider) string {
 	body = stripGeneratedSections(body)
+	if provider == scm.ProviderAzureDevOps || provider == scm.ProviderGitHub {
+		sections := joinBlocks(neutralizeAttestationMarkers(body), joinAppendixSections(riskLine, testingMD, pipelineMD))
+		measure := func(text string) int { return len(text) }
+		if compacted := fitPRIntent(sctx, sections, maxBytes, measure); len(compacted) <= maxBytes {
+			return compacted
+		}
+		intentReserve := 0
+		if intent := neutralizeAttestationMarkers(publicPRIntent(sctx)); intent != "" {
+			preview := compactIntentAtSentence(intent, maxBytes/4, measure)
+			intentReserve = len(joinBlocks("## Intent", preview, fullIntentCommentNote)) + 2
+		}
+		sections = appendGeneratedSectionsToCleanBodyWithinLimit(strings.TrimSpace(strings.ReplaceAll(body, prGeneratorLine, "")), riskLine, testingMD, pipelineMD, maxBytes-intentReserve-len(prGeneratorLine)-2)
+		if strings.Contains(sections, "## Risk Assessment") {
+			sections = strings.Replace(sections, "## Risk Assessment", prGeneratorLine+"\n\n## Risk Assessment", 1)
+		} else {
+			sections = joinBlocks(sections, prGeneratorLine)
+		}
+		coreIntact := strings.Contains(sections, "## What Changed") && (riskLine == "" || strings.Contains(sections, "## Risk Assessment")) && (pipelineMD == "" || strings.Contains(sections, "## Pipeline"))
+		if compacted := fitPRIntent(sctx, sections, maxBytes, measure); coreIntact && len(compacted) <= maxBytes {
+			return compacted
+		}
+		return fitPRCoreMeasured(sctx, body, riskLine, pipelineMD, maxBytes, measure, clampPRBytes, truncatePipelineSection)
+	}
 	sections := appendGeneratedSectionsToCleanBodyWithinLimit(body, riskLine, testingMD, pipelineMD, maxBytes)
 	// Neutralized for the same reason as in prependIntentSection: intent is
 	// agent-extracted text placed ahead of the pipeline section.
@@ -1468,7 +1519,7 @@ func isGeneratedSectionHeading(line string) bool {
 	heading = strings.ToLower(heading)
 
 	switch heading {
-	case "intent", "risk assessment", "testing", "tests", "pipeline":
+	case "intent", "risk", "risk assessment", "testing", "tests", "pipeline":
 		return true
 	default:
 		return false

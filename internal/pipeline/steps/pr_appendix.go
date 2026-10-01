@@ -113,7 +113,19 @@ func narrativeWithIntent(sctx *pipeline.StepContext, whatChanged string) string 
 	return prependIntentSection(narrative, sctx)
 }
 
-func assemblePRBody(sctx *pipeline.StepContext, whatChanged, riskLine, testingMD, pipelineMD string, bodyLimit int, provider scm.Provider) string {
+func assemblePRBody(sctx *pipeline.StepContext, whatChanged, riskLine, testingMD, pipelineMD string, bodyLimit int, provider scm.Provider) (body string) {
+	if provider == scm.ProviderGitHub {
+		defer func() { body = ensureGitHubWorkItems(sctx, body) }()
+		if bodyLimit > 0 {
+			bodyLimit -= scm.PRBodyLen(githubWorkItemLine(sctx, "") + "\n\n")
+		}
+	}
+	if provider == scm.ProviderAzureDevOps || provider == scm.ProviderGitHub {
+		whatChanged = legacyWhatChanged(whatChanged)
+		riskLine = normalizePRLineEndings(riskLine)
+		testingMD = normalizePRLineEndings(testingMD)
+		pipelineMD = normalizePRLineEndings(pipelineMD)
+	}
 	switch appendixMode(sctx) {
 	case config.PRAppendixMinimal:
 		return assembleMinimalPRBody(sctx, whatChanged, riskLine, pipelineMD, bodyLimit)
@@ -122,7 +134,7 @@ func assemblePRBody(sctx *pipeline.StepContext, whatChanged, riskLine, testingMD
 			return assembleCollapsedPRBody(sctx, whatChanged, riskLine, testingMD, pipelineMD, bodyLimit)
 		}
 	}
-	return assemblePRBodyFull(sctx, whatChanged, riskLine, testingMD, pipelineMD, bodyLimit)
+	return assemblePRBodyFull(sctx, whatChanged, riskLine, testingMD, pipelineMD, bodyLimit, provider)
 }
 
 func assembleMinimalPRBody(sctx *pipeline.StepContext, whatChanged, riskLine, pipelineMD string, bodyLimit int) string {
@@ -143,31 +155,44 @@ func assembleCollapsedPRBody(sctx *pipeline.StepContext, whatChanged, riskLine, 
 	return fitCollapsed(prefix, riskLine, testingMD, pipelineMD, bodyLimit, scm.PRBodyLen, scm.ClampPRBody)
 }
 
-func buildPRBody(body, riskLine, testingMD, pipelineMD string, sctx *pipeline.StepContext, provider scm.Provider) string {
-	switch appendixMode(sctx) {
-	case config.PRAppendixMinimal:
-		return buildMinimalPRBody(body, riskLine, pipelineMD, sctx)
-	case config.PRAppendixCollapsed:
-		if prBodyFlavorFor(provider) == prBodyHTML {
-			return buildCollapsedPRBody(body, riskLine, testingMD, pipelineMD, sctx)
+func buildPRBody(body, riskLine, testingMD, pipelineMD string, sctx *pipeline.StepContext, provider scm.Provider) (rendered string) {
+	maxBytes := maxPullRequestBodyBytes
+	if provider == scm.ProviderGitHub {
+		defer func() { rendered = ensureGitHubWorkItems(sctx, rendered) }()
+		if line := githubWorkItemLine(sctx, ""); line != "" {
+			maxBytes -= len(line) + 2
 		}
 	}
-	return buildPRBodyFull(body, riskLine, testingMD, pipelineMD, sctx, maxPullRequestBodyBytes)
+	if provider == scm.ProviderAzureDevOps || provider == scm.ProviderGitHub {
+		body = legacyWhatChanged(body)
+		riskLine = normalizePRLineEndings(riskLine)
+		testingMD = normalizePRLineEndings(testingMD)
+		pipelineMD = normalizePRLineEndings(pipelineMD)
+	}
+	switch appendixMode(sctx) {
+	case config.PRAppendixMinimal:
+		return buildMinimalPRBody(body, riskLine, pipelineMD, sctx, maxBytes)
+	case config.PRAppendixCollapsed:
+		if prBodyFlavorFor(provider) == prBodyHTML {
+			return buildCollapsedPRBody(body, riskLine, testingMD, pipelineMD, sctx, maxBytes)
+		}
+	}
+	return buildPRBodyFull(body, riskLine, testingMD, pipelineMD, sctx, maxBytes, provider)
 }
 
-func buildMinimalPRBody(body, riskLine, pipelineMD string, sctx *pipeline.StepContext) string {
+func buildMinimalPRBody(body, riskLine, pipelineMD string, sctx *pipeline.StepContext, maxBytes int) string {
 	prefix := narrativeWithIntent(sctx, body)
 	tail := minimalTail(riskLine, pipelineMD)
 	full := joinBlocks(prefix, tail)
-	if len(full) <= maxPullRequestBodyBytes {
+	if len(full) <= maxBytes {
 		return full
 	}
-	return shrinkMeasuredKeepingTail(full, tail, maxPullRequestBodyBytes, func(s string) int { return len(s) }, clampPRBytes)
+	return shrinkMeasuredKeepingTail(full, tail, maxBytes, func(s string) int { return len(s) }, clampPRBytes)
 }
 
-func buildCollapsedPRBody(body, riskLine, testingMD, pipelineMD string, sctx *pipeline.StepContext) string {
+func buildCollapsedPRBody(body, riskLine, testingMD, pipelineMD string, sctx *pipeline.StepContext, maxBytes int) string {
 	prefix := narrativeWithIntent(sctx, body)
-	return fitCollapsed(prefix, riskLine, testingMD, pipelineMD, maxPullRequestBodyBytes, func(s string) int { return len(s) }, clampPRBytes)
+	return fitCollapsed(prefix, riskLine, testingMD, pipelineMD, maxBytes, func(s string) int { return len(s) }, clampPRBytes)
 }
 
 func clampPRBytes(text string, max int) string {

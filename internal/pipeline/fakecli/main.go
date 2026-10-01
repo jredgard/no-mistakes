@@ -128,7 +128,11 @@ func logFakeCLIStdinBody(args []string, logFile string) {
 		return
 	}
 	defer f.Close()
-	fmt.Fprint(f, "stdin --body ")
+	marker := "stdin --body "
+	if len(args) > 1 && args[0] == "pr" && args[1] == "comment" {
+		marker = "stdin --comment "
+	}
+	fmt.Fprint(f, marker)
 	fmt.Fprintln(f, string(body))
 }
 
@@ -515,6 +519,17 @@ func fakeCIGHReconcileHandler(args []string) {
 }
 
 func fakeGHHandlePRContentCommands(args []string, joined string) {
+	if strings.Contains(joined, "pr view") && strings.Contains(joined, "--json comments") {
+		comments := os.Getenv("FAKE_CLI_REVIEW_COMMENTS")
+		if comments == "" {
+			comments = "[]"
+		}
+		fmt.Println(`{"comments":` + comments + `}`)
+		os.Exit(0)
+	}
+	if len(args) > 1 && args[0] == "pr" && args[1] == "comment" {
+		os.Exit(0)
+	}
 	if strings.Contains(joined, "pr view") && strings.Contains(joined, "--json title,body") {
 		if raw, ok := os.LookupEnv("FAKE_CLI_PR_CONTENT_JSON"); ok {
 			fmt.Println(raw)

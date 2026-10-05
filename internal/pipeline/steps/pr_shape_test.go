@@ -2,6 +2,7 @@ package steps
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -17,6 +18,159 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+func TestPRRiskAssessmentPreservesInitialRound(t *testing.T) {
+	t.Parallel()
+	initial := `{"findings":[{"id":"review-1","severity":"error","file":"release.go","description":"Deploy rolls back on a gate violation."}],"risk_level":"high","risk_rationale":"The gate runs inside the release verifier, so violations roll back the deploy."}`
+	original := "🚨 High: The gate runs inside the release verifier, so violations roll back the deploy."
+	for _, test := range []struct {
+		name          string
+		level         string
+		rationale     string
+		status        types.StepStatus
+		trigger       string
+		remaining     bool
+		single        bool
+		initialClean  bool
+		unreadable    bool
+		noRoundResult bool
+		transition    string
+	}{
+		{name: "high to low", level: "low", rationale: "Fix rounds moved the gate out of the release verifier.\n  Deploy rollback is unchanged.", status: types.StepStatusCompleted, trigger: "auto_fix", transition: "🚨 High -> ✅ Low: Fix rounds moved the gate out of the release verifier. Deploy rollback is unchanged."},
+		{name: "high to medium", level: "medium", rationale: "Rollback was removed; release integration still changes.", status: types.StepStatusCompleted, trigger: "auto_fix", transition: "🚨 High -> ⚠️ Medium: Rollback was removed; release integration still changes."},
+		{name: "same level", level: "high", rationale: "Still rolls back deploys.", status: types.StepStatusCompleted, trigger: "auto_fix"},
+		{name: "single round", single: true},
+		{name: "remaining finding", level: "low", rationale: "Some fixes landed.", status: types.StepStatusCompleted, trigger: "auto_fix", remaining: true},
+		{name: "review not passed", level: "low", rationale: "Rollback removed.", status: types.StepStatusFailed, trigger: "auto_fix"},
+		{name: "answer only", level: "low", rationale: "The answer disproved the risk.", status: types.StepStatusCompleted, trigger: "answer"},
+		{name: "missing rationale", level: "low", status: types.StepStatusCompleted, trigger: "auto_fix"},
+		{name: "unreadable final", status: types.StepStatusCompleted, trigger: "auto_fix", unreadable: true},
+		{name: "missing round result", level: "low", rationale: "Rollback removed.", status: types.StepStatusCompleted, trigger: "auto_fix", noRoundResult: true},
+		{name: "no initial findings to close", level: "low", rationale: "Risk was reconsidered.", status: types.StepStatusCompleted, trigger: "auto_fix", initialClean: true},
+		{name: "legacy fix", level: "low", rationale: "Rollback removed.", status: types.StepStatusCompleted, trigger: "user_fix", transition: "🚨 High -> ✅ Low: Rollback removed."},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			first := initial
+			if test.initialClean {
+				first = strings.Replace(first, `[{"id":"review-1","severity":"error","file":"release.go","description":"Deploy rolls back on a gate violation."}]`, "[]", 1)
+			}
+			rounds := []*db.StepRound{{Round: 1, Trigger: "initial", FindingsJSON: &first}}
+			current := first
+			if !test.single {
+				final := types.Findings{RiskLevel: test.level, RiskRationale: test.rationale, Items: []types.Finding{}}
+				if test.remaining {
+					final.Items = []types.Finding{{ID: "review-1", Description: "Rollback remains."}}
+				}
+				encoded, err := json.Marshal(final)
+				if err != nil {
+					t.Fatal(err)
+				}
+				current = string(encoded)
+				if test.unreadable {
+					current = `{"findings":[`
+				}
+				round := &db.StepRound{Round: 2, Trigger: test.trigger, FindingsJSON: &current}
+				if test.noRoundResult {
+					round.FindingsJSON = nil
+				}
+				rounds = append(rounds, round)
+			}
+			steps := []*db.StepResult{{ID: "review", StepName: types.StepReview, Status: test.status, FindingsJSON: &current}}
+			want := original
+			if test.transition != "" {
+				want += "\n" + test.transition
+			}
+			for _, provider := range []scm.Provider{scm.ProviderGitHub, scm.ProviderAzureDevOps, scm.ProviderGitLab, scm.ProviderGitea, scm.ProviderForgejo, scm.ProviderBitbucket} {
+				pipelineMD, risk := buildPipelineSummaryFor(steps, map[string][]*db.StepRound{"review": rounds}, testPipelineHeadSHA, provider, pipelineAttestationPolicy{})
+				if risk != want {
+					t.Fatalf("%s risk = %q, want %q", provider, risk, want)
+				}
+				body := assemblePRBody(nil, "## What Changed\n\n- Move the release gate.", risk, "", pipelineMD, scm.MaxPRBodyChars(provider), provider)
+				if !strings.Contains(body, "## Risk Assessment\n\n"+want+"\n\n## Pipeline") {
+					t.Fatalf("%s lost the recorded risk section:\n%s", provider, body)
+				}
+			}
+		})
+	}
+}
+
+func TestPRRiskAssessmentKeepsHigherFinalLevelUnchanged(t *testing.T) {
+	t.Parallel()
+	initial := `{"findings":[{"id":"review-1","description":"Concern."}],"risk_level":"medium","risk_rationale":"Initial concern."}`
+	final := `{"findings":[],"risk_level":"high","risk_rationale":"A broader concern remains."}`
+	steps := []*db.StepResult{{ID: "review", StepName: types.StepReview, Status: types.StepStatusCompleted, FindingsJSON: &final}}
+	rounds := map[string][]*db.StepRound{"review": {{Round: 1, Trigger: "initial", FindingsJSON: &initial}, {Round: 2, Trigger: "auto_fix", FindingsJSON: &final}}}
+	if risk := extractRiskLine(steps, rounds); risk != "⚠️ Medium: Initial concern." {
+		t.Fatalf("risk = %q", risk)
+	}
+}
+
+func TestPRRiskAssessmentBudgetKeepsTransition(t *testing.T) {
+	t.Parallel()
+	transition := "🚨 High -> ✅ Low: Fix rounds removed deploy rollback and preserved the release gate."
+	for _, mode := range []string{config.PRAppendixFull, config.PRAppendixCollapsed} {
+		for _, oversized := range []bool{false, true} {
+			initial := "🚨 High: The release gate could roll back deployments."
+			if oversized {
+				initial += strings.Repeat(" Release verifier rollback risk 😀.", 3000)
+			}
+			marker := buildPipelineAttestation([]*db.StepResult{{StepName: types.StepReview, Status: types.StepStatusCompleted}}, nil, testPipelineHeadSHA)
+			pipelineMD := "## Pipeline\n\n" + noMistakesPRSignature + "\n\n" + marker + "\n\n" + strings.Repeat("- ✅ review - passed\n", 500)
+			sctx := &pipeline.StepContext{UserIntent: strings.Repeat("Preserve deploys. ", 400), Config: &config.Config{PR: config.PR{Appendix: mode}}}
+			body := assemblePRBody(sctx, "## What Changed\n\n"+strings.Repeat("- Move the gate.\n", 500), initial+"\n"+transition, "## Testing\n\n"+strings.Repeat("Passed. ", 2000), pipelineMD, 4000, scm.ProviderAzureDevOps)
+			if scm.PRBodyLen(body) > 4000 || !utf8.ValidString(body) {
+				t.Fatalf("%s oversized=%t exceeded the Azure budget: %d", mode, oversized, scm.PRBodyLen(body))
+			}
+			for _, want := range []string{"## Risk Assessment\n\n🚨 High:", "\n" + transition, marker} {
+				if !strings.Contains(body, want) {
+					t.Fatalf("%s oversized=%t lost %q:\n%s", mode, oversized, want, body)
+				}
+			}
+			if !oversized && !strings.Contains(body, initial+"\n"+transition) {
+				t.Fatalf("%s truncated a risk section that fits:\n%s", mode, body)
+			}
+		}
+	}
+}
+
+func TestPRRiskAssessmentGitHubByteBudgetKeepsTransition(t *testing.T) {
+	t.Parallel()
+	transition := "🚨 High -> ✅ Low: Fix rounds removed deploy rollback."
+	risk := "🚨 High: " + strings.Repeat("Release rollback risk 😀. ", 5000) + "\n" + transition
+	marker := buildPipelineAttestation([]*db.StepResult{{StepName: types.StepReview, Status: types.StepStatusCompleted}}, nil, testPipelineHeadSHA)
+	pipelineMD := "## Pipeline\n\n" + noMistakesPRSignature + "\n\n" + marker
+	body := buildPRBody("## What Changed\n\n- Move the gate.", risk, "", pipelineMD, nil, scm.ProviderGitHub)
+	if len(body) > maxPullRequestBodyBytes || !strings.Contains(body, "\n"+transition) || !strings.Contains(body, marker) {
+		t.Fatalf("GitHub byte budget lost the transition or attestation: %d bytes", len(body))
+	}
+}
+
+func TestPRRiskAssessmentBudgetPrioritizesTransitionAndNeutralizesMarkers(t *testing.T) {
+	t.Parallel()
+	transition := "🚨 High -> ✅ Low: Rollback removed."
+	initial := "🚨 High: " + strings.Repeat("Rollback risk. ", 200)
+	for _, clamp := range []struct {
+		measure func(string) int
+		clamp   func(string, int) string
+	}{
+		{measure: scm.PRBodyLen, clamp: scm.ClampPRBody},
+		{measure: func(text string) int { return len(text) }, clamp: clampPRBytes},
+	} {
+		budget := clamp.measure(transition)
+		if got := clampRiskAssessment(initial+"\n"+transition, budget, clamp.measure, clamp.clamp); got != transition {
+			t.Fatalf("tight budget lost the transition: %q", got)
+		}
+	}
+	foreign := pipelineAttestationCommentPrefix + `{"head_sha":"foreign"}` + pipelineAttestationCommentClosingToken
+	marker := buildPipelineAttestation([]*db.StepResult{{StepName: types.StepReview, Status: types.StepStatusCompleted}}, nil, testPipelineHeadSHA)
+	pipelineMD := "## Pipeline\n\n" + noMistakesPRSignature + "\n\n" + marker
+	risk := initial + foreign + "\n" + transition + " " + foreign
+	body := foldedWithin(risk, "", pipelineMD, 1000)
+	if len(body) > 1000 || !strings.Contains(body, transition) || strings.Count(body, pipelineAttestationCommentPrefix) != 1 || !strings.Contains(body, marker) {
+		t.Fatalf("budgeted risk broke transition or attestation safety:\n%s", body)
+	}
+}
 
 func TestPRDescriptionV184Golden(t *testing.T) {
 	t.Parallel()

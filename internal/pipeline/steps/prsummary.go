@@ -1270,6 +1270,14 @@ func extractRiskLine(steps []*db.StepResult, rounds map[string][]*db.StepRound) 
 			continue
 		}
 
+		stepRounds := rounds[sr.ID]
+		var initialFindings *types.Findings
+		if len(stepRounds) > 0 && stepRounds[0].FindingsJSON != nil {
+			if findings, err := types.ParseFindingsJSON(*stepRounds[0].FindingsJSON); err == nil && findings.RiskLevel != "" {
+				initialFindings = &findings
+			}
+		}
+
 		var finalFindings *types.Findings
 		hasUnreadableFinal := false
 		if sr.FindingsJSON != nil {
@@ -1282,7 +1290,6 @@ func extractRiskLine(steps []*db.StepResult, rounds map[string][]*db.StepRound) 
 
 		src := finalFindings
 		if src == nil && !hasUnreadableFinal {
-			stepRounds := rounds[sr.ID]
 			if len(stepRounds) > 0 {
 				last := stepRounds[len(stepRounds)-1]
 				if last.FindingsJSON != nil {
@@ -1293,18 +1300,48 @@ func extractRiskLine(steps []*db.StepResult, rounds map[string][]*db.StepRound) 
 			}
 		}
 
+		if initialFindings != nil {
+			risk := recordedRiskLine(*initialFindings)
+			if sr.Status != types.StepStatusCompleted || src == nil || len(src.Items) != 0 || len(initialFindings.Items) == 0 || len(stepRounds) < 2 {
+				return risk
+			}
+			last := stepRounds[len(stepRounds)-1]
+			if last.FindingsJSON == nil {
+				return risk
+			}
+			final, err := types.ParseFindingsJSON(*last.FindingsJSON)
+			if err != nil || len(final.Items) != 0 || final.RiskLevel != src.RiskLevel || (final.RiskLevel != "low" && final.RiskLevel != "medium") || reviewRiskLevelRank(final.RiskLevel) >= reviewRiskLevelRank(initialFindings.RiskLevel) {
+				return risk
+			}
+			rationale := strings.Join(strings.Fields(final.RiskRationale), " ")
+			if rationale == "" {
+				return risk
+			}
+			for _, round := range stepRounds[1:] {
+				if !round.IsFixRound() || round.FindingsJSON == nil {
+					continue
+				}
+				if fixed, err := types.ParseFindingsJSON(*round.FindingsJSON); err == nil && len(fixed.Items) == 0 {
+					return risk + "\n" + fmt.Sprintf("%s %s -> %s %s: %s", riskEmoji(initialFindings.RiskLevel), capitalizeRisk(initialFindings.RiskLevel), riskEmoji(final.RiskLevel), capitalizeRisk(final.RiskLevel), rationale)
+				}
+			}
+			return risk
+		}
+
 		if src == nil || src.RiskLevel == "" {
 			return ""
 		}
-
-		emoji := riskEmoji(src.RiskLevel)
-		label := capitalizeRisk(src.RiskLevel)
-		if src.RiskRationale != "" {
-			return fmt.Sprintf("%s %s: %s", emoji, label, src.RiskRationale)
-		}
-		return fmt.Sprintf("%s %s", emoji, label)
+		return recordedRiskLine(*src)
 	}
 	return ""
+}
+
+func recordedRiskLine(findings types.Findings) string {
+	line := fmt.Sprintf("%s %s", riskEmoji(findings.RiskLevel), capitalizeRisk(findings.RiskLevel))
+	if findings.RiskRationale != "" {
+		line += ": " + findings.RiskRationale
+	}
+	return line
 }
 
 func capitalizeRisk(level string) string {

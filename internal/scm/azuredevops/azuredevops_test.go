@@ -33,8 +33,8 @@ func TestProviderAndCapabilities(t *testing.T) {
 	if !caps.MergeableState {
 		t.Fatal("Capabilities().MergeableState = false, want true")
 	}
-	if caps.FailedCheckLogs {
-		t.Fatal("Capabilities().FailedCheckLogs = true, want false (not implemented)")
+	if !caps.FailedCheckLogs {
+		t.Fatal("Capabilities().FailedCheckLogs = false, want true")
 	}
 }
 
@@ -726,19 +726,6 @@ func TestFindPRReturnsCLIError(t *testing.T) {
 	_, err := h.FindPR(context.Background(), "feature", "")
 	if err == nil || !strings.Contains(err.Error(), "az repos pr list") {
 		t.Fatalf("FindPR() error = %v, want az repos pr list context", err)
-	}
-}
-
-func TestFetchFailedCheckLogsUnsupported(t *testing.T) {
-	t.Parallel()
-
-	h := newTestHost(nil)
-	logs, err := h.FetchFailedCheckLogs(context.Background(), &scm.PR{Number: "42"}, "feature", "abc123", []string{"ci-build"})
-	if logs != "" {
-		t.Fatalf("FetchFailedCheckLogs() logs = %q, want empty", logs)
-	}
-	if err != scm.ErrUnsupported {
-		t.Fatalf("FetchFailedCheckLogs() error = %v, want ErrUnsupported", err)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
@@ -81,11 +82,10 @@ func NewWithDraft(cmd CmdFactory, cliAvailable func() bool, org, project, repo s
 func (h *Host) Provider() scm.Provider { return scm.ProviderAzureDevOps }
 
 // Capabilities reports the Azure DevOps feature matrix. Merge status is
-// reliably available from `az repos pr show`. Failed-check log fetching is not
-// yet wired up - the az CLI has no first-class build-log command, so callers
-// gate on FailedCheckLogs and skip it.
+// reliably available from `az repos pr show`. Failed build logs use the build
+// timeline and logs REST resources through the authenticated az devops invoke.
 func (h *Host) Capabilities() scm.Capabilities {
-	return scm.Capabilities{MergeableState: true, FailedCheckLogs: false}
+	return scm.Capabilities{MergeableState: true, FailedCheckLogs: true}
 }
 
 // orgArgs scopes a command to the organization. The show/update/policy-list
@@ -345,19 +345,9 @@ func (h *Host) GetPRState(ctx context.Context, pr *scm.PR) (scm.PRState, error) 
 }
 
 func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
-	id := h.prID(pr)
-	if id == "" {
-		return nil, errors.New("az repos pr policy list: missing PR id")
-	}
-	args := append([]string{"repos", "pr", "policy", "list", "--id", id}, h.orgArgs()...)
-	args = append(args, "--output", "json")
-	out, err := outputJSON(h.cmd(ctx, "az", args...))
+	evals, err := h.policyEvaluations(ctx, pr)
 	if err != nil {
-		return nil, fmt.Errorf("az repos pr policy list: %w", err)
-	}
-	var evals []policyEval
-	if err := json.Unmarshal(out, &evals); err != nil {
-		return nil, fmt.Errorf("parse policy evaluations: %w", err)
+		return nil, err
 	}
 	checks := make([]scm.Check, 0, len(evals))
 	for _, e := range evals {
@@ -383,6 +373,24 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 	return checks, nil
 }
 
+func (h *Host) policyEvaluations(ctx context.Context, pr *scm.PR) ([]policyEval, error) {
+	id := h.prID(pr)
+	if id == "" {
+		return nil, errors.New("az repos pr policy list: missing PR id")
+	}
+	args := append([]string{"repos", "pr", "policy", "list", "--id", id}, h.orgArgs()...)
+	args = append(args, "--output", "json")
+	out, err := outputJSON(h.cmd(ctx, "az", args...))
+	if err != nil {
+		return nil, fmt.Errorf("az repos pr policy list: %w", err)
+	}
+	var evals []policyEval
+	if err := json.Unmarshal(out, &evals); err != nil {
+		return nil, fmt.Errorf("parse policy evaluations: %w", err)
+	}
+	return evals, nil
+}
+
 func (h *Host) GetMergeableState(ctx context.Context, pr *scm.PR) (scm.MergeableState, error) {
 	got, err := h.showPR(ctx, pr)
 	if err != nil {
@@ -391,11 +399,184 @@ func (h *Host) GetMergeableState(ctx context.Context, pr *scm.PR) (scm.Mergeable
 	return normalizeMergeableState(got.MergeStatus), nil
 }
 
-// FetchFailedCheckLogs is not yet implemented for Azure DevOps; callers gate on
-// Capabilities().FailedCheckLogs (false) and skip it.
-func (h *Host) FetchFailedCheckLogs(_ context.Context, _ *scm.PR, _ string, _ string, _ []string) (string, error) {
-	return "", scm.ErrUnsupported
+func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, branch, headSHA string, failingNames []string) (string, error) {
+	targets := make([]scm.CheckTarget, 0, len(failingNames))
+	for _, name := range failingNames {
+		targets = append(targets, scm.CheckTarget{Name: name})
+	}
+	logs, err := h.FetchFailedCheckTargetLogs(ctx, pr, branch, headSHA, targets)
+	if err != nil {
+		return "", err
+	}
+	return scm.CombineFailedCheckLogs(logs)
 }
+
+const maxFailedLogBytes = 32 * 1024
+
+// FetchFailedCheckTargetLogs resolves selected checks from the live PR policy
+// context. It deliberately does not infer builds from branch or headSHA: build
+// policies can run against Azure's synthetic merge commit.
+func (h *Host) FetchFailedCheckTargetLogs(ctx context.Context, pr *scm.PR, _, _ string, targets []scm.CheckTarget) ([]scm.FailedCheckLog, error) {
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	evals, err := h.policyEvaluations(ctx, pr)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]scm.FailedCheckLog, len(targets))
+	budget := max(0, maxFailedLogBytes-2*(len(targets)-1)) / len(targets)
+	for i, target := range targets {
+		results[i].Target = target
+		var outputs []string
+		var errs []error
+		var builds []policyEval
+		for _, e := range evals {
+			matches := strings.TrimSpace(target.Name) != "" && e.checkName() == strings.TrimSpace(target.Name)
+			if target.ProviderID != "" {
+				matches = target.ProviderID == "azure-policy-evaluation:"+strings.TrimSpace(e.EvaluationID)
+			}
+			if matches && strings.EqualFold(strings.TrimSpace(e.Configuration.Type.DisplayName), "build") && azStatusBucket(e.Status) == scm.CheckBucketFail {
+				builds = append(builds, e)
+			}
+		}
+		if len(builds) == 0 {
+			results[i].Err = fmt.Errorf("selected Azure DevOps check %q has no failing build policy", target.Identity())
+			continue
+		}
+		for _, e := range builds {
+			out, fetchErr := h.failedBuildLogs(ctx, e, budget/len(builds))
+			if out != "" {
+				outputs = append(outputs, out)
+			}
+			if fetchErr != nil {
+				errs = append(errs, fetchErr)
+			}
+		}
+		results[i].Output = strings.Join(outputs, "")
+		results[i].Err = errors.Join(errs...)
+	}
+	return results, nil
+}
+
+type buildTimelineRecord struct {
+	ID       string `json:"id"`
+	ParentID string `json:"parentId"`
+	Type     string `json:"type"`
+	Name     string `json:"name"`
+	Result   string `json:"result"`
+	Log      *struct {
+		ID int `json:"id"`
+	} `json:"log"`
+}
+
+// invokeBuild uses az's existing organization-scoped credentials. Request JSON
+// explicitly: invoke cannot print text/plain responses without --out-file, and
+// the build log endpoint's JSON representation is {"count":N,"value":[lines]}.
+func (h *Host) invokeBuild(ctx context.Context, resource, buildID string, route ...string) ([]byte, error) {
+	args := []string{"devops", "invoke", "--area", "build", "--resource", resource, "--route-parameters", "project=" + h.project, "buildId=" + buildID}
+	args = append(args, route...)
+	args = append(args, h.orgArgs()...)
+	args = append(args, "--api-version", "7.1", "--http-method", "GET", "--accept-media-type", "application/json", "--output", "json")
+	return outputJSON(h.cmd(ctx, "az", args...))
+}
+
+func (h *Host) failedBuildLogs(ctx context.Context, e policyEval, budget int) (string, error) {
+	buildID := strings.TrimSpace(fmt.Sprint(e.Context["buildId"]))
+	if numeric, ok := e.Context["buildId"].(float64); ok {
+		// policyEval.Context uses encoding/json's float64 numbers. fmt.Sprint
+		// switches large build IDs to scientific notation, which is not a route ID.
+		buildID = strconv.FormatFloat(numeric, 'f', -1, 64)
+	}
+	id, err := strconv.ParseInt(buildID, 10, 64)
+	if err != nil || id <= 0 || h.project == "" {
+		return "", fmt.Errorf("Azure DevOps check %q: missing project or positive buildId", e.checkName())
+	}
+	out, err := h.invokeBuild(ctx, "timeline", buildID)
+	if err != nil {
+		return "", fmt.Errorf("Azure DevOps build %s timeline: %w", buildID, err)
+	}
+	var timeline struct {
+		Records *[]buildTimelineRecord `json:"records"`
+	}
+	if err := json.Unmarshal(out, &timeline); err != nil || timeline.Records == nil {
+		return "", fmt.Errorf("Azure DevOps build %s: missing or malformed timeline records", buildID)
+	}
+	byID := make(map[string]buildTimelineRecord)
+	var failed []buildTimelineRecord
+	seenLogs := make(map[int]bool)
+	for _, r := range *timeline.Records {
+		byID[r.ID] = r
+		if !strings.EqualFold(r.Result, "failed") || (!strings.EqualFold(r.Type, "job") && !strings.EqualFold(r.Type, "task")) || r.Log == nil || r.Log.ID <= 0 || seenLogs[r.Log.ID] {
+			continue
+		}
+		seenLogs[r.Log.ID] = true
+		failed = append(failed, r)
+	}
+	if len(failed) == 0 {
+		return "", fmt.Errorf("Azure DevOps build %s: no failed task or job logs in timeline", buildID)
+	}
+	var outputs []string
+	var errs []error
+	for _, r := range failed {
+		out, err := h.invokeBuild(ctx, "logs", buildID, "logId="+strconv.Itoa(r.Log.ID))
+		if err != nil {
+			errs = append(errs, fmt.Errorf("Azure DevOps build %s log %d: %w", buildID, r.Log.ID, err))
+			continue
+		}
+		var log struct {
+			Value *[]string `json:"value"`
+		}
+		if err := json.Unmarshal(out, &log); err != nil || log.Value == nil || len(*log.Value) == 0 {
+			errs = append(errs, fmt.Errorf("Azure DevOps build %s log %d: missing or malformed log lines", buildID, r.Log.ID))
+			continue
+		}
+		job := r
+		for n := 0; !strings.EqualFold(job.Type, "job") && n < len(byID); n++ {
+			parent, ok := byID[job.ParentID]
+			if !ok {
+				break
+			}
+			job = parent
+		}
+		header := fmt.Sprintf("=== Check %q / Job %q", e.checkName(), job.Name)
+		if strings.EqualFold(r.Type, "task") {
+			header += fmt.Sprintf(" / Task %q", r.Name)
+		}
+		header += fmt.Sprintf(" (build %s, log %d) ===\n", buildID, r.Log.ID)
+		outputs = append(outputs, boundedBuildLog(header, strings.Join(*log.Value, "\n"), budget/len(failed)))
+	}
+	return strings.Join(outputs, ""), errors.Join(errs...)
+}
+
+func boundedBuildLog(header, log string, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	if len(header) >= budget {
+		end := budget
+		for end > 0 && end < len(header) && !utf8.RuneStart(header[end]) {
+			end--
+		}
+		return header[:end]
+	}
+	content := strings.TrimSpace(log) + "\n\n"
+	remaining := budget - len(header)
+	if len(content) > remaining {
+		marker := "[... log truncated; showing tail ...]\n"
+		if len(marker) > remaining {
+			return header
+		}
+		start := len(content) - (remaining - len(marker))
+		for start < len(content) && !utf8.RuneStart(content[start]) {
+			start++
+		}
+		content = marker + content[start:]
+	}
+	return header + content
+}
+
+var _ scm.TargetedFailedCheckLogsHost = (*Host)(nil)
 
 func (h *Host) showPR(ctx context.Context, pr *scm.PR) (*azPR, error) {
 	id := h.prID(pr)

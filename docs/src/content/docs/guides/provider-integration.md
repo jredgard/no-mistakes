@@ -32,7 +32,7 @@ What you do not get is PR automation and CI monitoring.
 | **CI** (polling, auto-fix) | `gh` CLI | `glab` CLI | `forgejo-axi` | same env vars | `az` CLI | `tea` CLI |
 | **Merge conflict auto-fix** | `gh` CLI | `glab` CLI | `forgejo-axi` | not supported | `az` CLI | not supported |
 | **Mergeability polling** | `gh` CLI | `glab` CLI | `forgejo-axi` | not supported | `az` CLI | not supported |
-| **Failed check log fetching** | `gh` CLI | `glab` CLI | `forgejo-axi` when runtime routes are available | supported | not yet | supported |
+| **Failed check log fetching** | `gh` CLI | `glab` CLI | `forgejo-axi` when runtime routes are available | supported | `az devops invoke` (build timeline and logs) | supported |
 | **Review-bot findings and comments at the CI gate** | GitHub via `gh` CLI | not supported | not supported | not supported | not supported | not supported |
 | **[Transient-check rerun](/no-mistakes/reference/repo-config/#cirerun_transient)** (cancellations and pre-run infra failures) | `gh` CLI | not supported | not supported | not supported | not supported | not supported |
 
@@ -212,11 +212,10 @@ well as their SSH forms (`git@ssh.dev.azure.com:v3/...`).
   status checks) are read via `az repos pr policy list` until the PR is
   completed, abandoned, or the configured `ci_timeout` idle window elapses
 - Merge-conflict polling and auto-fix from the PR's `mergeStatus`
+- Failed build task and job logs for the CI auto-fix step, via the build timeline and logs REST endpoints using the existing `az` authentication
 
 **What you don't get (yet):**
 
-- Failed check log fetching for the CI auto-fix step (the `az` CLI has no
-  first-class build-log command)
 - Fork PR routing (same as GitLab, Forgejo, and Bitbucket)
 
 ## Gitea

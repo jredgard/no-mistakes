@@ -59,6 +59,8 @@ type CIStep struct {
 	pollIntervalOverride time.Duration    // if set, overrides computed poll interval (for testing)
 	waitForNextPoll      func(context.Context, time.Duration) error
 	now                  func() time.Time
+
+	pendingNoChangeConclusion string // park fresh issues as ask-user after a fixer declines a code change
 	// baseBranchTip resolves the current tip SHA of the upstream default
 	// branch. The bool is false when the SHA is a fallback/unknown value and
 	// must not re-arm the timeout. Overridable for testing; defaults to
@@ -269,6 +271,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 		}
 		s.pendingFixSummary = ""
 		s.pendingRepairPublish = false
+		s.pendingNoChangeConclusion = ""
 	}()
 	defer func() {
 		if !retryRefusal {
@@ -702,6 +705,9 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 						sctx.Log(ciChecksAwaitingApprovalMsg)
 					}
 					sctx.Log(fmt.Sprintf("issues detected: %s", findings.Summary))
+					if s.pendingNoChangeConclusion != "" {
+						return ciRepairParkOutcome(findings, "", s.pendingNoChangeConclusion), nil
+					}
 					return ciObservationOutcome(findings), nil
 				}
 			} else {
@@ -728,6 +734,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					// evidence; there is no grace-period promotion path.
 					if sctx.Config != nil && sctx.Config.NoCI {
 						sctx.DeferredFindings = ""
+						s.pendingNoChangeConclusion = ""
 						lastMonitorLog = logCIMonitorStatus(sctx, ciNoChecksPassedMsg, lastMonitorLog)
 					} else {
 						clearCIMonitorReady(sctx)
@@ -736,6 +743,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					}
 				case allChecksPassed(checks):
 					sctx.DeferredFindings = ""
+					s.pendingNoChangeConclusion = ""
 					lastMonitorLog = logCIMonitorStatus(sctx, ciChecksPassedMsg, lastMonitorLog)
 				default:
 					clearCIMonitorReady(sctx)

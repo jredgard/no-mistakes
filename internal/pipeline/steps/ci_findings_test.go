@@ -478,7 +478,7 @@ func TestCIResumedRepairSnapshotsSelectedCheckCompletion(t *testing.T) {
 	step := &CIStep{}
 
 	outcome, err := step.repairFromFindings(sctx, host, &scm.PR{Number: "42"})
-	if err != nil || outcome == nil || !outcome.NeedsApproval {
+	if err != nil || outcome != nil {
 		t.Fatalf("repair outcome = %#v, err = %v", outcome, err)
 	}
 	if host.headSHA != headSHA {

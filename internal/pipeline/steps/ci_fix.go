@@ -60,13 +60,11 @@ const ciMergeConflictFixRules = `- Resolve the merge conflicts by applying the m
 // It returns a non-nil outcome when the round ends this execution: a
 // protected-path refusal, a fix agent that burned its whole invocation
 // budget, a repair whose attestation could not be settled, a repair that must
-// revalidate from Review, or the agent's conclusion that no code change is
-// warranted - the last two of those park the selected findings as ask-user,
-// because a question the agent has already declined to answer with code is a
-// human's to answer. A nil outcome means monitoring resumes: either the
+// revalidate from Review. A nil outcome means monitoring resumes: either the
 // repair was published and the provider must re-run the checks against it,
-// or the agent produced nothing and the next settled observation re-emits
-// the same findings so the executor can retry while auto_fix.ci allows.
+// or the agent produced nothing and live checks must be re-polled. A trusted
+// no-code-change conclusion parks only fresh remaining issues as ask-user.
+// Without that conclusion, fresh issues can retry while auto_fix.ci allows.
 func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR) (*pipeline.StepOutcome, error) {
 	targets, err := parseCIFixTargets(sctx.PreviousFindings)
 	if err != nil {
@@ -145,9 +143,18 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 	}
 	if repair.NoCodeChangeNeeded {
 		sctx.Log(fmt.Sprintf("CI fixer concluded no code change is needed: %s", repair.Summary))
-		return ciRepairParkOutcome(targets.Findings, sctx.DeferredFindings, repair.Summary), nil
+		s.pendingNoChangeConclusion = repair.Summary
 	}
 	sctx.Log("CI fix produced no changes, resuming monitoring...")
+	// There is no new head to wait on, but checks on the published head may
+	// have changed while the fixer ran. Resume the ordinary monitor instead
+	// of parking the selected snapshot, and restore running status so a green
+	// re-poll can surface checks-passed through AXI and the TUI.
+	if sctx.MarkRunning != nil {
+		if err := sctx.MarkRunning(); err != nil {
+			return nil, err
+		}
+	}
 	return nil, nil
 }
 

@@ -37,6 +37,7 @@ See the [quick start](https://kunchenguid.github.io/no-mistakes/start-here/quick
 
 - Go 1.25+, standard toolchain. See `AGENTS.md` for agent instructions.
 - Run `make fmt`, `make lint`, and `make test` before pushing. Run `make e2e` too when you touch agent integrations, the e2e harness, or recorded fixtures. The pipeline will run them again, but a fast local pass saves rounds.
+- CLI package tests use one isolated `HOME` per test process at `/tmp/nm-cli-home-*` on Unix, or under the system temporary directory on Windows. Each home records its owner PID, allocation time and package. Normal success/failure and SIGINT/SIGTERM remove it; after a timeout, crash or SIGKILL, the next CLI test invocation sweeps homes whose recorded owner has exited, plus unmarked legacy homes older than 24 hours. Live owner PIDs and unreadable or invalid ownership records are preserved, and every orphan removal is logged to stderr. The daemon does not manage these test homes.
 - Run `make skill` when you change the canonical agent skill content under `internal/skill`; `make lint` fails if any committed no-mistakes skill file has drifted.
 - Use `make e2e-record` only when an upstream agent wire format changes or you are adding a new agent or fixture flavor. It overwrites `internal/e2e/fixtures/`, spends real API quota, and the diff should be reviewed before committing.
 - Keep `README.md` high-level. Deep reference material belongs in `docs/`.

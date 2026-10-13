@@ -42,9 +42,9 @@ const (
 	StateLegacyUnbound        = "legacy_unbound"
 	StateCustodyReturned      = "custody_returned"
 	// StateUserOwned reports a branch released by its terminal outcome: the
-	// run ended before the pipeline changed the submitted head, so no
-	// pipeline-created content exists to recover and the exact branch and head
-	// are the operator's, immediately usable with no sync action.
+	// run ended with an unchanged submitted head, or guarded recovery proved
+	// the local branch contains all cancelled published work. The exact branch
+	// and head are the operator's, immediately usable with no sync action.
 	StateUserOwned = "user_owned"
 )
 
@@ -125,6 +125,7 @@ type NextAction struct {
 // preserves the divergent later head while custody returns at RequiredHead.
 type RecoveryEvidence struct {
 	Source        string
+	Directory     string
 	RepositoryID  string
 	RunID         string
 	Branch        string
@@ -286,6 +287,9 @@ func (s *Service) InspectCached(ctx context.Context) State {
 // no-mistakes ref. It never updates an ordinary remote-tracking ref.
 func (s *Service) Refresh(ctx context.Context) State {
 	state, run, ok := s.inspect(ctx)
+	if state.State == StateUserOwned && run != nil && run.LastPushedSHA == nil {
+		return state
+	}
 	if !ok || !refreshable(state) {
 		return state
 	}
@@ -401,6 +405,7 @@ func (s *Service) Refresh(ctx context.Context) State {
 	}
 
 	s.classifyRelation(ctx, &state, bound, run.BaseSHA, true)
+	s.classifyCancelledPublished(ctx, &state, freshRun)
 	return state
 }
 
@@ -688,6 +693,9 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 		state.Recovered = true
 		state.Changed = false
 		return state
+	}
+	if cancelledPublishedRecoveryOffered(state) {
+		return s.recoverCancelledPublished(ctx, run)
 	}
 	if state.State != StatePipelineOwned || run == nil {
 		return blockedPlan(state, state.State, "blocked_recover_not_applicable", "nothing to recover: the branch is not held by a terminal run with unpublished pipeline commits; no files or refs were changed")
@@ -1849,6 +1857,7 @@ func (s *Service) inspect(ctx context.Context) (State, *db.Run, bool) {
 	}
 
 	s.classifyRelation(ctx, &state, ptr(run.LastPushedSHA), run.BaseSHA, false)
+	s.classifyCancelledPublished(ctx, &state, run)
 	return state, run, true
 }
 
@@ -1988,7 +1997,7 @@ func (s *Service) workDir() string {
 
 func refreshable(state State) bool {
 	switch state.State {
-	case StateBehind, StateSynchronized, StateLocalAhead, StateDiverged, StateMergedRemoteRetained, StateClosed, StateAmbiguousContext:
+	case StateBehind, StateSynchronized, StateLocalAhead, StateDiverged, StateMergedRemoteRetained, StateClosed, StateAmbiguousContext, StateUserOwned:
 		return true
 	default:
 		return false
@@ -2310,8 +2319,20 @@ func (s *Service) recoverySourceAvailable(ctx context.Context, state *State, run
 		ordinaryAvailable = isAncestor(ctx, gateDir, local, preserved) || preservedContainsLocalWork(ctx, gateDir, local, preserved)
 	}
 	if ordinaryAvailable {
+		var evidence *RecoveryEvidence
+		if gateAvailable {
+			anchored, exists, err := git.ExactRefTarget(ctx, gateDir, custody.RecoveryRef(run.ID))
+			if err == nil && exists && anchored == preserved {
+				evidence = &RecoveryEvidence{
+					Source: "gate_ref", Directory: gateDir, RepositoryID: s.Repo.ID,
+					RunID: run.ID, Branch: run.Branch, RequiredHead: local,
+					PreservedHead: preserved, ArchiveRef: custody.RecoveryRef(run.ID), Proof: "verified",
+				}
+			}
+		}
 		return recoverySourceProof{
 			available: true,
+			evidence:  evidence,
 			action:    NextAction{Code: "recover_custody", Command: "no-mistakes axi sync --recover"},
 		}
 	}
@@ -2510,9 +2531,9 @@ func exactCommitRefCompatible(ctx context.Context, repoDir, ref, expected string
 }
 
 // classifyUserOwned reports a branch released by its terminal outcome: the
-// terminal run ended before the pipeline changed the submitted head, so no
-// pipeline-created content exists to recover. The exact branch and head are
-// the operator's and immediately usable - no sync action is required or
+// terminal run ended with an unchanged submitted head, or explicit recovery
+// proved the local branch contains all cancelled published work. The branch
+// and head are the operator's and immediately usable - no sync action is required or
 // offered, and a separately authorized direct push or PR is never blocked.
 func (s *Service) classifyUserOwned(ctx context.Context, state *State) {
 	state.State = StateUserOwned

@@ -392,6 +392,11 @@ func TestAxiCustodyRecoveryJourney(t *testing.T) {
 			t.Errorf("abort output missing %q:\n%s", want, abortOut)
 		}
 	}
+	for _, want := range []string{"source: gate_ref", "archive_ref: " + custody.RecoveryRef(run.ID), "preserved_in:"} {
+		if !strings.Contains(abortOut, want) {
+			t.Errorf("abort does not report preservation location %q:\n%s", want, abortOut)
+		}
+	}
 
 	gateDir := filepath.Join(h.NMHome, "repos", h.repoID()+".git")
 	preservedBytes, err := h.runGit(context.Background(), gateDir, "rev-parse", custody.RecoveryRef(run.ID))

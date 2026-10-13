@@ -324,6 +324,8 @@ func TestCleanupOrphanWorktrees_ConfiguredRootRemovesOnlyRunDirectories(t *testi
 		t.Fatal(err)
 	}
 
+	seedCleanupWorktree(t, p, terminalRun, terminalWT)
+
 	cleanupOrphanWorktrees(d, p, leftoverRecordedRunWorktrees(d, p))
 
 	if _, err := os.Stat(terminalWT); !os.IsNotExist(err) {
@@ -369,6 +371,8 @@ func TestCleanupOrphanWorktrees_UnconfiguredRepoUsesDefaultRoot(t *testing.T) {
 	if err := os.MkdirAll(terminalWT, 0o755); err != nil {
 		t.Fatal(err)
 	}
+
+	seedCleanupWorktree(t, p, terminalRun, terminalWT)
 
 	cleanupOrphanWorktrees(d, p, leftoverRecordedRunWorktrees(d, p))
 
@@ -611,6 +615,9 @@ func TestCleanupOrphanWorktrees_OperatorRootRemovesOnlyWhatARunRecorded(t *testi
 		}
 	}
 
+	seedCleanupWorktree(t, p, ownRun, ownWT)
+	seedCleanupWorktree(t, p, otherRun, otherWT)
+
 	cleanupOrphanWorktrees(d, p, leftoverRecordedRunWorktrees(d, p))
 
 	for _, gone := range []string{ownWT, otherWT} {
@@ -750,6 +757,8 @@ func TestCleanupOrphanWorktrees_ReachesARootTheConfigNoLongerNames(t *testing.T)
 	if err := d.UpdateRunStatus(run.ID, types.RunFailed); err != nil {
 		t.Fatal(err)
 	}
+
+	seedCleanupWorktree(t, p, run, recordedWT)
 
 	cleanupOrphanWorktrees(d, p, leftoverRecordedRunWorktrees(d, p))
 

@@ -139,6 +139,8 @@ func TestRecoverOnStartup_DoesNotDeleteActiveRunWorktree(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	seedCleanupWorktree(t, p, terminalRun, terminalWT)
+
 	cleanupOrphanWorktrees(d, p, leftoverRecordedRunWorktrees(d, p))
 
 	if _, err := os.Stat(activeWT); err != nil {

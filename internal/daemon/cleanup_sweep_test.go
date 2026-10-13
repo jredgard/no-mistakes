@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/procreap"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -43,11 +45,11 @@ func TestCleanupOrphanWorktreesSweepsEveryRemovableDirectoryInOneSnapshot(t *tes
 
 	// Two finished runs in the default tree, one in a directory of the
 	// operator's own, and one run still executing.
-	firstDefault := placeCleanupRun(t, d, repo.ID, defaultTree, types.RunFailed)
-	secondDefault := placeCleanupRun(t, d, repo.ID, defaultTree, types.RunCompleted)
+	firstDefault := placeCleanupRun(t, d, p, repo.ID, defaultTree, types.RunFailed)
+	secondDefault := placeCleanupRun(t, d, p, repo.ID, defaultTree, types.RunCompleted)
 	operatorRoot := filepath.Join(t.TempDir(), "repo-runs")
-	recorded := placeCleanupRun(t, d, repo.ID, operatorRoot, types.RunFailed)
-	activeDefault := placeCleanupRun(t, d, repo.ID, defaultTree, types.RunRunning)
+	recorded := placeCleanupRun(t, d, p, repo.ID, operatorRoot, types.RunFailed)
+	activeDefault := placeCleanupRun(t, d, p, repo.ID, defaultTree, types.RunRunning)
 
 	var sweeps [][]procreap.Worktree
 	original := sweepRunWorktrees
@@ -83,7 +85,7 @@ func TestCleanupOrphanWorktreesSweepsEveryRemovableDirectoryInOneSnapshot(t *tes
 
 // placeCleanupRun records a run placed in root, creates its directory, and
 // leaves it in the given status.
-func placeCleanupRun(t *testing.T, d *db.DB, repoID, root string, status types.RunStatus) string {
+func placeCleanupRun(t *testing.T, d *db.DB, p *paths.Paths, repoID, root string, status types.RunStatus) string {
 	t.Helper()
 	run, err := d.InsertRun(repoID, "feature", "head", "base")
 	if err != nil {
@@ -99,5 +101,31 @@ func placeCleanupRun(t *testing.T, d *db.DB, repoID, root string, status types.R
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	seedCleanupWorktree(t, p, run, dir)
 	return dir
+}
+
+// Cleanup fixtures must have real Git heads: an unreadable managed head now
+// intentionally retains the directory rather than guessing it is disposable.
+func seedCleanupWorktree(t *testing.T, p *paths.Paths, run *db.Run, dir string) {
+	t.Helper()
+	gate := p.RepoDir(run.RepoID)
+	if _, err := os.Stat(gate); os.IsNotExist(err) {
+		if err := git.InitBare(context.Background(), gate); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed := t.TempDir()
+	gitCmd(t, seed, "init", "-b", "main")
+	gitCmd(t, seed, "config", "user.email", "test@test.com")
+	gitCmd(t, seed, "config", "user.name", "Test")
+	gitCmd(t, seed, "commit", "--allow-empty", "-m", "cleanup fixture")
+	head := gitOutput(t, seed, "rev-parse", "HEAD")
+	gitCmd(t, seed, "push", gate, "HEAD:refs/heads/fixture-"+run.ID)
+	if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err := git.WorktreeAdd(context.Background(), gate, dir, head); err != nil {
+		t.Fatal(err)
+	}
 }

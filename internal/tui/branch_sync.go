@@ -17,6 +17,9 @@ func renderLocalBranchStatus(state *branchsync.State, refreshing bool, width int
 	footer := ""
 	if refreshing {
 		message = "Refreshing the exact configured push target..."
+	} else if state.Safety == "blocked_cancelled_published_recoverable" {
+		message = "The cancelled pipeline head is contained in your local branch. Recover custody to continue on the same branch."
+		footer = "u recover custody"
 	} else {
 		switch state.State {
 		case branchsync.StatePipelineOwned:
@@ -65,7 +68,7 @@ func renderLocalBranchStatus(state *branchsync.State, refreshing bool, width int
 		case branchsync.StateCustodyReturned:
 			message = "Custody returned; the branch is yours. Start a fresh run when ready."
 		case branchsync.StateUserOwned:
-			message = "Run ended before the pipeline changed anything; the branch and head are yours and immediately usable."
+			message = "The branch and head are yours and immediately usable."
 		default:
 			return ""
 		}
@@ -109,7 +112,7 @@ func boundedTUISyncValue(value string) string {
 // recoverableBranchSync reports whether the state is the stranded terminal
 // pipeline_owned custody state that the guarded recovery action can end.
 func recoverableBranchSync(state *branchsync.State) bool {
-	return state != nil && state.State == branchsync.StatePipelineOwned && state.Safety == "blocked_pipeline_owned_recoverable"
+	return state != nil && ((state.State == branchsync.StatePipelineOwned && state.Safety == "blocked_pipeline_owned_recoverable") || state.Safety == "blocked_cancelled_published_recoverable")
 }
 
 func archiveKeepLocalRecovery(state *branchsync.State) bool {
@@ -121,6 +124,10 @@ func renderRecoverConfirmation(state branchsync.State, width int) string {
 		width = 80
 	}
 	var b strings.Builder
+	if state.Safety == "blocked_cancelled_published_recoverable" {
+		b.WriteString("The cancelled pipeline head is contained in your local branch.\nRecovery verifies the live push binding and anchors the old pipeline head.\nYour branch, worktree, gate lane, and remote are left in place.\n")
+		return renderBoxWithFooter("Confirm custody recovery", b.String(), width, "u/enter recover  ·  esc cancel")
+	}
 	fmt.Fprintf(&b, "The run ended %s without publishing its pipeline commits.\n", state.Pipeline.Status)
 	if archiveKeepLocalRecovery(&state) {
 		fmt.Fprintf(&b, "A verified archive preserves the divergent later head. Recovery keeps the\n")

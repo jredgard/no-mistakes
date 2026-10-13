@@ -177,6 +177,37 @@ func TestMissingPreservedHeadStatusShowsKeepLocalRecoveryCommand(t *testing.T) {
 	}
 }
 
+func TestCancelledPublishedCustodyActionUsesSharedRecovery(t *testing.T) {
+	m := NewModel("socket", nil, &ipc.RunInfo{ID: "cancelled", Status: types.RunCancelled})
+	state := branchsync.State{
+		State: branchsync.StateDiverged, Safety: "blocked_cancelled_published_recoverable",
+		NextAction: &branchsync.NextAction{Code: "recover_custody", Command: "no-mistakes axi sync --recover"},
+	}
+	m.branchSync = &state
+	calls := 0
+	m.syncRecover = func(keepLocal bool) branchsync.State {
+		calls++
+		if keepLocal {
+			t.Fatal("published recovery should use the offered ordinary recovery")
+		}
+		return branchsync.State{State: branchsync.StateUserOwned, Recovered: true}
+	}
+	next, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	m = next.(Model)
+	if !m.recoverConfirm || cmd != nil || calls != 0 {
+		t.Fatal("recovery did not require confirmation")
+	}
+	next, cmd = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("confirmation did not call recovery")
+	}
+	m.Update(cmd())
+	if calls != 1 {
+		t.Fatalf("recovery calls = %d", calls)
+	}
+}
+
 // TestRecoverableCustodyActionFlowsThroughConfirmationAndRecoverService covers
 // the TUI half of the guarded custody recovery: a terminal pre-push
 // pipeline_owned state renders the recovery offer, `u` opens an explicit

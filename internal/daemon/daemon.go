@@ -884,7 +884,40 @@ func removableOrphanWorktree(d *db.DB, wt orphanWorktree) bool {
 		slog.Info("skipping worktree cleanup", "path", wt.dir, "reason", reason)
 		return false
 	}
+	if reason := preserveHeadBeforeWorktreeCleanup(context.Background(), run, wt.dir); reason != "" {
+		slog.Info("skipping worktree cleanup", "path", wt.dir, "reason", reason)
+		return false
+	}
 	return true
+}
+
+// Cleanup is the last preservation boundary, including when terminalization
+// failed to read or anchor the head. Never remove the only reference to an
+// unpublished commit. A conflicting anchor retains the checkout for inspection.
+func preserveHeadBeforeWorktreeCleanup(ctx context.Context, run *db.Run, wtDir string) string {
+	if run == nil {
+		return ""
+	}
+	if _, err := os.Stat(wtDir); os.IsNotExist(err) {
+		return ""
+	}
+	head, err := git.HeadSHA(ctx, wtDir)
+	if err != nil {
+		return fmt.Sprintf("worktree head unreadable; preserving %s: %v", wtDir, err)
+	}
+	known := ""
+	if run.LastPushedSHA != nil {
+		known = *run.LastPushedSHA
+	} else if run.SubmittedHeadSHA != nil {
+		known = *run.SubmittedHeadSHA
+	}
+	if head == known {
+		return ""
+	}
+	if err := custody.PreserveRecoveryHead(ctx, wtDir, run.ID, head); err != nil {
+		return fmt.Sprintf("cannot preserve unpublished head %s at %s; retaining %s: %v", head, custody.RecoveryRef(run.ID), wtDir, err)
+	}
+	return ""
 }
 
 // removeOrphanWorktree removes one run worktree directory its caller has

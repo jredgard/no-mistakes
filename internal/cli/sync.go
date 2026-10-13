@@ -168,6 +168,10 @@ func runHumanSync(cmd *cobra.Command, check, yes bool) error {
 		result = "refused"
 		return &exitError{code: 1}
 	}
+	if state.Safety == "blocked_cancelled_published_recoverable" {
+		result = "refused"
+		return &exitError{code: 1}
+	}
 	if state.State == branchsync.StateSynchronized || state.State == branchsync.StateMergedRemoteRemoved || state.State == branchsync.StateUserOwned {
 		result = "noop"
 		return nil
@@ -397,6 +401,9 @@ func printHumanSyncState(cmd *cobra.Command, state branchsync.State) {
 }
 
 func humanSyncSummary(state branchsync.State) string {
+	if state.Safety == "blocked_cancelled_published_recoverable" {
+		return "the cancelled pipeline head is contained locally; recover custody with `no-mistakes sync --recover` to continue on the same branch"
+	}
 	switch state.State {
 	case branchsync.StatePipelineOwned:
 		if state.Safety == "blocked_pipeline_owned_recoverable" {
@@ -418,7 +425,7 @@ func humanSyncSummary(state branchsync.State) string {
 		}
 		return "custody returned; the branch is yours - start a fresh run when ready"
 	case branchsync.StateUserOwned:
-		return "run ended before the pipeline changed anything; the branch and head are yours and immediately usable"
+		return "the branch and head are yours and immediately usable"
 	case branchsync.StatePushInProgress:
 		return "pipeline branch update is in progress; synchronization is unavailable"
 	case branchsync.StateBehind:
@@ -565,6 +572,9 @@ func boundedSyncValue(value string) string {
 }
 
 func syncStateSuccessful(state branchsync.State, check bool) bool {
+	if state.Safety == "blocked_cancelled_published_recoverable" {
+		return false
+	}
 	if state.State == branchsync.StateSynchronized || state.State == branchsync.StateMergedRemoteRemoved {
 		return true
 	}
@@ -639,6 +649,9 @@ func branchSyncField(state branchsync.State) toON.Field {
 			toON.Field{Key: "keep_local", Value: state.Recovery.KeepLocal},
 			toON.Field{Key: "proof", Value: state.Recovery.Proof},
 		)})
+		if state.Recovery.Directory != "" {
+			fields = append(fields, toON.Field{Key: "preserved_in", Value: state.Recovery.Directory})
+		}
 	}
 	if state.Error != "" {
 		fields = append(fields, toON.Field{Key: "note", Value: state.Error})

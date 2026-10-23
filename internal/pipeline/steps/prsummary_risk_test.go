@@ -81,8 +81,8 @@ func TestBuildPipelineSummary_ReviewUsesFinalCleanState(t *testing.T) {
 	if strings.Contains(md, "user-fixed") {
 		t.Errorf("did not expect user-fixed in review line, got:\n%s", md)
 	}
-	if strings.Contains(risk, "initial risk rationale") {
-		t.Errorf("did not expect stale initial rationale in risk, got: %q", risk)
+	if !strings.HasPrefix(risk, "⚠️ Medium: initial risk rationale\n⚠️ Medium -> ✅ Low: ") {
+		t.Errorf("expected original risk followed by its transition, got: %q", risk)
 	}
 	if !strings.Contains(risk, "follow-up fixes reduced risk") {
 		t.Errorf("expected final rationale in risk, got: %q", risk)
@@ -174,7 +174,7 @@ func TestBuildPipelineSummary_DoesNotClaimFixedWhenFinalFindingsUnreadable(t *te
 	}
 }
 
-func TestBuildPipelineSummary_ReviewDoesNotReuseInitialRiskWhenFinalUnreadable(t *testing.T) {
+func TestBuildPipelineSummary_ReviewKeepsInitialRiskWhenFinalUnreadable(t *testing.T) {
 	t.Parallel()
 	initialFindings := `{"findings":[{"id":"review-1","severity":"warning","description":"risky change"}],"summary":"1 warning","risk_level":"medium","risk_rationale":"initial risk rationale"}`
 	invalidFinalFindings := `{"findings":[`
@@ -192,8 +192,8 @@ func TestBuildPipelineSummary_ReviewDoesNotReuseInitialRiskWhenFinalUnreadable(t
 	if !strings.Contains(md, "⚠️ **Review** - findings unavailable") {
 		t.Errorf("expected unavailable review status when final findings are unreadable, got:\n%s", md)
 	}
-	if risk != "" {
-		t.Errorf("expected empty risk when final findings are unreadable, got: %q", risk)
+	if risk != "⚠️ Medium: initial risk rationale" {
+		t.Errorf("expected original risk without a transition when final findings are unreadable, got: %q", risk)
 	}
 	if !strings.Contains(md, "failed to parse findings") {
 		t.Errorf("expected parse failure details for unreadable final review findings, got:\n%s", md)
@@ -225,10 +225,8 @@ func TestBuildPipelineSummary_FindingSeverityEmoji(t *testing.T) {
 	}
 }
 
-func TestBuildPipelineSummary_ReviewUsesLatestRoundNotFirst(t *testing.T) {
+func TestBuildPipelineSummary_ReviewKeepsFirstRoundWhenUsingLatestFallback(t *testing.T) {
 	t.Parallel()
-	// When sr.FindingsJSON is nil (cleared), the fallback should use the
-	// latest round's risk assessment, not the first round's stale one.
 	initialFindings := `{"findings":[{"id":"review-1","severity":"warning","description":"issue"}],"summary":"1 warning","risk_level":"medium","risk_rationale":"initial concern"}`
 	latestFindings := `{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"issues resolved"}`
 	steps := []*db.StepResult{
@@ -242,8 +240,8 @@ func TestBuildPipelineSummary_ReviewUsesLatestRoundNotFirst(t *testing.T) {
 	}
 	_, risk := BuildPipelineSummary(steps, rounds, testPipelineHeadSHA)
 
-	if strings.Contains(risk, "initial concern") {
-		t.Errorf("expected latest round risk, not stale first round, got: %q", risk)
+	if !strings.HasPrefix(risk, "⚠️ Medium: initial concern\n⚠️ Medium -> ✅ Low: ") {
+		t.Errorf("expected original risk followed by the latest round's transition, got: %q", risk)
 	}
 	if !strings.Contains(risk, "issues resolved") {
 		t.Errorf("expected latest round rationale, got: %q", risk)

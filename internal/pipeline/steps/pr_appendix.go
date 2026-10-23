@@ -255,11 +255,18 @@ func foldedWithin(risk, testing, pipeline string, innerBudget int) string {
 		return ""
 	}
 	if risk != "" {
-		riskBudget := budget - len(minimum) - len("## Risk Assessment\n\n") - len("\n\n") - len("\n\n")
+		reservedPipeline := minimumPipelineRetainingLatestUpdate(pipeline)
+		if reservedPipeline == "" || len(reservedPipeline) > budget {
+			reservedPipeline = minimumPipelineOmissionSection(pipeline)
+		}
+		if reservedPipeline == "" || len(reservedPipeline) > budget {
+			reservedPipeline = minimum
+		}
+		riskBudget := budget - len(reservedPipeline) - len("## Risk Assessment\n\n") - len("\n\n") - len("\n\n")
 		if riskBudget <= 0 {
 			risk = ""
 		} else if len(risk) > riskBudget {
-			risk = truncateTextAtLineBoundary(risk, riskBudget, essentialPRBodyTruncationMarker())
+			risk = clampRiskAssessment(risk, riskBudget, func(text string) int { return len(text) }, clampPRBytes)
 		}
 	}
 	inner := strings.Trim(appendGeneratedSectionsToCleanBodyWithinLimit("", risk, testing, pipeline, budget), "\n")
@@ -267,6 +274,37 @@ func foldedWithin(risk, testing, pipeline string, innerBudget int) string {
 		inner = minimum
 	}
 	return wrapValidation(inner)
+}
+
+func clampRiskAssessment(risk string, budget int, measure func(string) int, clamp func(string, int) string) string {
+	if budget <= 0 {
+		return ""
+	}
+	if measure(risk) <= budget {
+		return risk
+	}
+	separator := strings.LastIndex(risk, "\n")
+	if separator < 0 {
+		return clamp(risk, budget)
+	}
+	original, transition := risk[:separator], risk[separator+1:]
+	for _, first := range []string{"medium", "high"} {
+		for _, final := range []string{"low", "medium"} {
+			prefix := riskEmoji(first) + " " + capitalizeRisk(first) + " -> " + riskEmoji(final) + " " + capitalizeRisk(final) + ": "
+			if strings.HasPrefix(transition, prefix) {
+				remaining := budget - measure(transition) - measure("\n")
+				if remaining <= 0 {
+					return clamp(transition, budget)
+				}
+				original = clamp(original, remaining)
+				if original == "" {
+					return transition
+				}
+				return original + "\n" + transition
+			}
+		}
+	}
+	return clamp(risk, budget)
 }
 
 func shrinkMeasuredKeepingTail(full, tail string, limit int, units func(string) int, clamp func(string, int) string) string {

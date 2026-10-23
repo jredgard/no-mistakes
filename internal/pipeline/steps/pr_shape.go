@@ -135,7 +135,7 @@ func fitPRCoreMeasured(sctx *pipeline.StepContext, whatChanged, risk, pipelineMD
 		return clamp(fixed, limit)
 	}
 	if measure(risk) > budget/3 {
-		risk = clamp(risk, budget/3)
+		risk = clampRiskAssessment(risk, budget/3, measure, clamp)
 	}
 	remaining := budget - measure(risk)
 	if measure(narrative) > remaining/2 {

@@ -245,6 +245,13 @@ func TestCIWorkflow_WindowsHangSurfacesAsGoTimeoutNotJobCancellation(t *testing.
 		if shard == "" {
 			t.Fatalf("Windows test step %q is not gated on matrix.shard", job.Steps[command.step].Name)
 		}
+		wantTimeout := 15 * time.Minute
+		if shard == "steps" {
+			wantTimeout = 25 * time.Minute
+		}
+		if goTimeout != wantTimeout {
+			t.Fatalf("Windows %s shard timeout = %s, want %s to accommodate steps runtime while keeping the other shard budgets", shard, goTimeout, wantTimeout)
+		}
 		stepShards[shard] = struct{}{}
 		patterns := goTestPackagePatterns(command)
 		switch {

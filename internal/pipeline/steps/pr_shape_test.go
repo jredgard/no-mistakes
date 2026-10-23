@@ -87,7 +87,11 @@ func TestPRRiskAssessmentPreservesInitialRound(t *testing.T) {
 					t.Fatalf("%s risk = %q, want %q", provider, risk, want)
 				}
 				body := assemblePRBody(nil, "## What Changed\n\n- Move the release gate.", risk, "", pipelineMD, scm.MaxPRBodyChars(provider), provider)
-				if !strings.Contains(body, "## Risk Assessment\n\n"+want+"\n\n## Pipeline") {
+				publishedRisk := want
+				if provider == scm.ProviderGitLab {
+					publishedRisk = strings.ReplaceAll(publishedRisk, "Fix rounds", "Fix&#32;rounds")
+				}
+				if !strings.Contains(body, "## Risk Assessment\n\n"+publishedRisk+"\n\n## Pipeline") {
 					t.Fatalf("%s lost the recorded risk section:\n%s", provider, body)
 				}
 			}
@@ -166,7 +170,7 @@ func TestPRRiskAssessmentBudgetPrioritizesTransitionAndNeutralizesMarkers(t *tes
 	marker := buildPipelineAttestation([]*db.StepResult{{StepName: types.StepReview, Status: types.StepStatusCompleted}}, nil, testPipelineHeadSHA)
 	pipelineMD := "## Pipeline\n\n" + noMistakesPRSignature + "\n\n" + marker
 	risk := initial + foreign + "\n" + transition + " " + foreign
-	body := foldedWithin(risk, "", pipelineMD, 1000)
+	body := foldedWithin(risk, "", pipelineMD, 1000, scm.ProviderGitHub)
 	if len(body) > 1000 || !strings.Contains(body, transition) || strings.Count(body, pipelineAttestationCommentPrefix) != 1 || !strings.Contains(body, marker) {
 		t.Fatalf("budgeted risk broke transition or attestation safety:\n%s", body)
 	}

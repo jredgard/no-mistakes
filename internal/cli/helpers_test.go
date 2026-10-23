@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -83,12 +84,26 @@ func TestMain(m *testing.M) {
 	os.Exit(runWithCLIHome(base, func(root, home string) int {
 		_ = os.Setenv("NM_HOME", root)
 		_ = os.Setenv("HOME", home)
+		_ = os.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(home, "gitconfig"))
 		_ = os.Setenv("NO_MISTAKES_TELEMETRY", "off")
 		_ = os.Setenv("NO_MISTAKES_NO_UPDATE_CHECK", "1")
 		code := m.Run()
 		_ = daemon.Stop(paths.WithRoot(root))
 		return code
 	}))
+}
+
+// removeTestDir removes dir even when it holds read-only directories. Child
+// go commands run with the test HOME and write their module cache under it
+// read-only, which a plain os.RemoveAll cannot delete.
+func removeTestDir(dir string) error {
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			_ = os.Chmod(path, 0o700)
+		}
+		return nil
+	})
+	return os.RemoveAll(dir)
 }
 
 func explicitDaemonRunRootFromArgs(args []string) (string, bool) {

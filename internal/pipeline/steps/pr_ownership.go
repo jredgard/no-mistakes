@@ -20,6 +20,14 @@ const (
 
 var prAppendixMarkerPattern = regexp.MustCompile(`(?i)<!--\s*/?\s*` + prAppendixNamespace)
 
+func escapePRAppendixMarkers(s string) string {
+	return prAppendixMarkerPattern.ReplaceAllStringFunc(s, func(marker string) string {
+		// Break the namespace without rewriting ordinary mentions of its name.
+		i := strings.LastIndex(marker, "-")
+		return marker[:i] + "\\" + marker[i:]
+	})
+}
+
 func hasPRAppendixMarkers(body string) bool {
 	return prAppendixMarkerPattern.MatchString(body)
 }
@@ -52,7 +60,7 @@ func parsePROwnedBody(body string) (prOwnedBody, error) {
 		return prOwnedBody{}, fmt.Errorf("malformed PR appendix ownership markers")
 	}
 	parts := prOwnedBody{before: body[:start], appendix: body[contentStart : end-1], after: body[afterEnd:], managed: true}
-	if markdownFenceOpen(parts.appendix) || fmt.Sprintf("%x", sha256.Sum256([]byte(parts.appendix))) != body[digestStart:digestStart+64] {
+	if markdownFenceOpen(parts.appendix) || !appendixDigestMatches(parts.appendix, body[digestStart:digestStart+64]) {
 		return prOwnedBody{}, fmt.Errorf("PR appendix was edited or is malformed; refusing to overwrite possible author content")
 	}
 	if strings.Contains(parts.before+parts.after, pipelineAttestationCommentPrefix) || strings.Count(parts.appendix, pipelineAttestationCommentPrefix) != 1 {
@@ -119,11 +127,10 @@ func wrapPRAppendix(appendix string) string {
 func composeOwnedPRContent(parts prOwnedBody, title, appendix string, bodyLimit int) (prContent, error) {
 	before := redactPRContent(prContent{Body: parts.before}).Body
 	after := redactPRContent(prContent{Body: parts.after}).Body
-	appendix = prAppendixMarkerPattern.ReplaceAllStringFunc(appendix, func(marker string) string {
-		// Break the namespace without rewriting ordinary mentions of its name.
-		i := strings.LastIndex(marker, "-")
-		return marker[:i] + "\\" + marker[i:]
-	})
+	// Before the marker escape: removing a control byte must not be able to
+	// splice a marker together after the escape has looked for one.
+	appendix = neutralizePRControls(appendix)
+	appendix = escapePRAppendixMarkers(appendix)
 	appendix = redactPRContent(prContent{Body: appendix}).Body
 	if !parts.managed && before != "" {
 		before += "\n\n"
@@ -163,8 +170,14 @@ func updateOwnedPR(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, initia
 		if current.Body == "" && !parts.managed {
 			parts.before = emptyNarrative
 		}
-		content, err := composeOwnedPRContent(parts, title, appendix, bodyLimit)
+		// The author text around the appendix is kept verbatim, so only
+		// references it does not already close are added.
+		authorText := parts.before + "\n" + parts.after
+		content, err := composeOwnedPRContent(parts, title, appendIssuesSection(appendix, issuesSection(sctx, authorText)), bodyLimit)
 		if err != nil {
+			return err
+		}
+		if err := verifyClosingIssuesInBody(content.Body, sctx); err != nil {
 			return err
 		}
 		latest, err := reader.GetPRContent(sctx.Ctx, pr)

@@ -65,7 +65,7 @@ func sweepCLIHomeOrphans(base string, now time.Time) {
 				continue
 			}
 		}
-		if err := os.RemoveAll(dir); err != nil {
+		if err := removeTestDir(dir); err != nil {
 			fmt.Fprintf(os.Stderr, "remove orphan CLI test home %s: %v\n", dir, err)
 		} else {
 			fmt.Fprintf(os.Stderr, "removed orphan CLI test home %s (%s)\n", dir, reason)
@@ -97,7 +97,7 @@ func runWithCLIHome(base string, run func(root, home string) int) int {
 	cleanup := func() {
 		once.Do(func() {
 			for _, dir := range []string{home, root} {
-				if err := os.RemoveAll(dir); err != nil {
+				if err := removeTestDir(dir); err != nil {
 					fmt.Fprintf(os.Stderr, "remove CLI test scratch %s: %v\n", dir, err)
 				}
 			}

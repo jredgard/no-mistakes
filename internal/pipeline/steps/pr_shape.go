@@ -66,7 +66,7 @@ func legacyPipelineSummary(steps []*db.StepResult, rounds map[string][]*db.StepR
 			}
 			line = marker + line[separator:]
 		}
-		lines = append(lines, "- "+neutralizeAttestationMarkers(line))
+		lines = append(lines, "- "+neutralizeAttestationMarkers(scm.ProviderGitHub, line))
 	}
 	if len(lines) == 0 {
 		return ""
@@ -121,8 +121,8 @@ func fitPRCore(sctx *pipeline.StepContext, whatChanged, risk, pipelineMD string,
 }
 
 func fitPRCoreMeasured(sctx *pipeline.StepContext, whatChanged, risk, pipelineMD string, limit int, measure func(string) int, clamp, clampPipeline func(string, int) string) string {
-	whatChanged = neutralizeAttestationMarkers(whatChanged)
-	risk = neutralizeAttestationMarkers(risk)
+	whatChanged = neutralizeAttestationMarkers(resolvedProviderForBody(sctx), whatChanged)
+	risk = neutralizeAttestationMarkers(resolvedProviderForBody(sctx), risk)
 	intent := ""
 	if publicPRIntent(sctx) != "" {
 		intent = "## Intent\n\n" + fullIntentCommentNote
@@ -175,7 +175,7 @@ func ensureGitHubWorkItems(sctx *pipeline.StepContext, body string) string {
 }
 
 func fitPRIntent(sctx *pipeline.StepContext, sections string, limit int, measure func(string) int) string {
-	intent := neutralizeAttestationMarkers(publicPRIntent(sctx))
+	intent := neutralizeAttestationMarkers(resolvedProviderForBody(sctx), publicPRIntent(sctx))
 	full := prependIntentSection(sections, sctx)
 	if limit <= 0 || measure(full) <= limit || intent == "" {
 		return full
@@ -191,7 +191,7 @@ func publishPRReferences(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, 
 		if !ok {
 			return fmt.Errorf("provider cannot publish the full intent comment")
 		}
-		comment := "## Full intent\n\n" + safepath.RedactText(neutralizeAttestationMarkers(publicPRIntent(sctx)))
+		comment := "## Full intent\n\n" + safepath.RedactText(neutralizeAttestationMarkers(resolvedProviderForBody(sctx), publicPRIntent(sctx)))
 		if err := publisher.EnsurePRComment(sctx.Ctx, pr, comment); err != nil {
 			return fmt.Errorf("publish full intent comment: %w", err)
 		}

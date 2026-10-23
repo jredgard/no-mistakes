@@ -123,14 +123,22 @@ const (
 	MergeableConflict MergeableState = "CONFLICTING"
 	MergeablePending  MergeableState = "PENDING"
 	MergeableUnknown  MergeableState = "UNKNOWN"
+	// MergeableBehind is a conflict-free PR the forge still refuses to merge
+	// because its base requires branches to be up to date. Only GitHub
+	// reports it (mergeStateStatus BEHIND).
+	MergeableBehind MergeableState = "BEHIND"
 )
 
 // Conflict reports whether the state indicates a known merge conflict.
 func (s MergeableState) Conflict() bool { return s == MergeableConflict }
 
-// Resolved reports whether the state is final (MERGEABLE or CONFLICTING).
+// Behind reports whether the PR must be brought up to date with its base
+// before the forge will merge it.
+func (s MergeableState) Behind() bool { return s == MergeableBehind }
+
+// Resolved reports whether the state is final (MERGEABLE, BEHIND or CONFLICTING).
 func (s MergeableState) Resolved() bool {
-	return s == MergeableOK || s == MergeableConflict
+	return s == MergeableOK || s == MergeableBehind || s == MergeableConflict
 }
 
 // CheckBucket is the normalized outcome of a CI check.
@@ -193,7 +201,16 @@ type Check struct {
 	// is a wait on a maintainer rather than a verdict on the code: such a
 	// check is reported pending, never failing, so the CI step waits for the
 	// approval instead of spending auto-fix rounds on work that never ran.
-	AwaitingApproval     bool
+	AwaitingApproval bool
+	// AwaitingManualJob marks a check the provider is holding on a manual job
+	// a person must run before the pipeline can finish - GitLab's
+	// blocking manual job (`when: manual` with `allow_failure: false`), which
+	// stops the pipeline at its stage. Like AwaitingApproval it is a wait on a
+	// human rather than a verdict on the commit, so it is reported pending and
+	// never sent to the fix agent; unlike a skipped job, it keeps the pipeline
+	// from reading green while the pipeline is still stopped, and no rerun can
+	// clear it.
+	AwaitingManualJob    bool
 	UnstartedPolicyBuild bool
 	// App identifies the provider application that published the check, when
 	// the provider reports one: on GitHub it is the check suite's app slug
@@ -216,14 +233,15 @@ type ReviewBot struct {
 	// AppSlug is the provider app slug the bot publishes its check under.
 	AppSlug string
 	// Logins are the account logins the bot posts review comments as.
-	Logins []string
+	Logins       []string
+	GitLabLogins []string
 }
 
 // ReviewBots is the registry of supported review bots. Both halves of the
 // integration - check identity and comment authorship - read it, so adding a
 // bot is one entry here.
 var ReviewBots = []ReviewBot{
-	{AppSlug: "greptile-apps", Logins: []string{"greptile-apps[bot]", "greptile-apps"}},
+	{AppSlug: "greptile-apps", Logins: []string{"greptile-apps[bot]", "greptile-apps"}, GitLabLogins: []string{"greptileai"}},
 }
 
 // ReviewBotForApp returns the registered review bot that publishes checks
@@ -244,13 +262,20 @@ func ReviewBotForApp(slug string) (ReviewBot, bool) {
 
 // ReviewBotForLogin returns the registered review bot that posts review
 // comments as login.
-func ReviewBotForLogin(login string) (ReviewBot, bool) {
+func ReviewBotForLogin(provider Provider, login string) (ReviewBot, bool) {
 	login = strings.ToLower(strings.TrimSpace(login))
 	if login == "" {
 		return ReviewBot{}, false
 	}
 	for _, bot := range ReviewBots {
-		for _, known := range bot.Logins {
+		var logins []string
+		switch provider {
+		case ProviderGitHub:
+			logins = bot.Logins
+		case ProviderGitLab:
+			logins = bot.GitLabLogins
+		}
+		for _, known := range logins {
 			if strings.EqualFold(known, login) {
 				return bot, true
 			}
@@ -260,13 +285,19 @@ func ReviewBotForLogin(login string) (ReviewBot, bool) {
 }
 
 // IsReviewBotLogin reports whether login belongs to a registered review bot.
-func IsReviewBotLogin(login string) bool {
-	_, ok := ReviewBotForLogin(login)
+func IsReviewBotLogin(provider Provider, login string) bool {
+	_, ok := ReviewBotForLogin(provider, login)
 	return ok
 }
 
 // Pending reports whether the check is still running or queued.
 func (c Check) Pending() bool { return c.Bucket == CheckBucketPending }
+
+// HeldForHuman reports whether the provider is holding the check on a person -
+// a maintainer approval or a manual job - so it will not progress on its own
+// no matter how long the monitor waits. Such a check is pending, but it never
+// defers escalation of the other checks' failures.
+func (c Check) HeldForHuman() bool { return c.AwaitingApproval || c.AwaitingManualJob }
 
 // Capabilities declares which optional Host methods return meaningful data.
 // Callers must consult Capabilities before invoking optional methods.
@@ -275,6 +306,12 @@ type Capabilities struct {
 	FailedCheckLogs bool
 	MergedProof     bool
 	ReviewComments  bool
+	// ClosingReferences declares that the provider closes issues from a
+	// closing keyword in the pull request body ("Closes #42"), which is what
+	// makes an explicitly requested --closes reference render and verify. False
+	// keeps the step failing closed rather than publishing a reference the
+	// forge would ignore, leaving the issue silently open.
+	ClosingReferences bool
 }
 
 var (

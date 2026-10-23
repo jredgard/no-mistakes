@@ -1,4 +1,10 @@
+# Every upstream sync imports upstream's release files. Exempt a PR only when
+# its author is the repository owner and both generated files at its head are
+# byte-identical to upstream's current main.
 name: Guard generated files
+
+env:
+  UPSTREAM_URL: https://github.com/kunchenguid/no-mistakes.git
 
 on:
   pull_request:
@@ -23,8 +29,7 @@ jobs:
   check:
     name: Generated files must not be hand-edited
     runs-on: ubuntu-latest
-    # release-please owns CHANGELOG.md and .release-please-manifest.json; its PR
-    # is the one legitimate place those files change, so we exempt its author.
+    # Automation-owned release PRs keep their existing author exemption.
     if: >-
       github.event.pull_request.user.login != 'github-actions[bot]' &&
       github.event.pull_request.user.login != 'release-please[bot]'
@@ -39,6 +44,8 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           set -eu
           files=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")
@@ -51,6 +58,29 @@ jobs:
           done
 
           if [ -n "$violated" ]; then
+            if [ "$PR_AUTHOR" = "$REPOSITORY_OWNER" ]; then
+              comparison_dir=$(mktemp -d)
+              trap 'rm -rf "$comparison_dir"' EXIT
+              if git fetch --no-tags "$UPSTREAM_URL" refs/heads/main; then
+                upstream_sha=$(git rev-parse FETCH_HEAD)
+                matches_upstream=1
+                for path in CHANGELOG.md .release-please-manifest.json; do
+                  if git show "${HEAD_SHA}:${path}" > "$comparison_dir/head" &&
+                     git show "${upstream_sha}:${path}" > "$comparison_dir/upstream" &&
+                     cmp -s "$comparison_dir/head" "$comparison_dir/upstream"; then
+                    continue
+                  fi
+                  echo "Owner sync exemption does not apply: ${path} differs from upstream main or could not be read."
+                  matches_upstream=0
+                done
+                if [ "$matches_upstream" -eq 1 ]; then
+                  echo "Owner sync exemption: both generated files match upstream main. OK."
+                  exit 0
+                fi
+              else
+                echo "Owner sync exemption unavailable: could not fetch upstream main."
+              fi
+            fi
             {
               echo "::error::This PR modifies release-please-generated files:${violated}"
               echo

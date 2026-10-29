@@ -25,6 +25,12 @@ var _ pipeline.ApprovalOverrideVerifier = (*TestStep)(nil)
 func (s *TestStep) Name() types.StepName { return types.StepTest }
 
 func (s *TestStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	restoreEnv, runtimeErr := prepareRepositoryRuntime(sctx)
+	if runtimeErr != nil {
+		return nil, runtimeErr
+	}
+	defer restoreEnv()
+
 	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
 		return nil, err
 	}

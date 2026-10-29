@@ -24,6 +24,12 @@ type ReviewStep struct {
 func (s *ReviewStep) Name() types.StepName { return types.StepReview }
 
 func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	restoreEnv, runtimeErr := prepareRepositoryRuntime(sctx)
+	if runtimeErr != nil {
+		return nil, runtimeErr
+	}
+	defer restoreEnv()
+
 	planSection, err := verificationPlanPromptSection(sctx)
 	if err != nil {
 		return nil, err

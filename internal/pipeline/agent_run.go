@@ -96,6 +96,9 @@ func (sctx *StepContext) runAgent(parent context.Context, opts agent.RunOpts, se
 	}
 	if sctx != nil {
 		ag = sctx.Agent
+		// Repository commands launched by agent tools inherit the same step
+		// environment as configured shell commands. Invocation overrides win.
+		opts.Env = append(append([]string(nil), sctx.Env...), opts.Env...)
 	}
 	activity := observeAgentActivity(&opts)
 	return invokeAgent(parent, timeout, working, cause, activity, func(ctx context.Context) (*agent.Result, error) {

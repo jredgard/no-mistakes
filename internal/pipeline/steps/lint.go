@@ -16,6 +16,12 @@ type LintStep struct{}
 func (s *LintStep) Name() types.StepName { return types.StepLint }
 
 func (s *LintStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	restoreEnv, runtimeErr := prepareRepositoryRuntime(sctx)
+	if runtimeErr != nil {
+		return nil, runtimeErr
+	}
+	defer restoreEnv()
+
 	outcome, err := s.executeRepositoryLint(sctx)
 	if err != nil || len(sctx.Config.CommandOverrides["lint"].Additional) == 0 {
 		return outcome, err

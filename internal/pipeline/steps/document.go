@@ -86,6 +86,12 @@ var housekeepingFindingsSchema = json.RawMessage(`{
 }`)
 
 func (s *DocumentStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	restoreEnv, runtimeErr := prepareRepositoryRuntime(sctx)
+	if runtimeErr != nil {
+		return nil, runtimeErr
+	}
+	defer restoreEnv()
+
 	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
 		return nil, err
 	}

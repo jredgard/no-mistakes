@@ -379,10 +379,12 @@ type RepositoryOverrides map[string]RepositoryOverride
 
 // RepoConfig represents .no-mistakes.yaml in a repo root.
 type RepoConfig struct {
-	Agent          types.AgentName   `yaml:"agent"`
-	Agents         []types.AgentName `yaml:"-"`
-	Commands       Commands          `yaml:"commands"`
-	IgnorePatterns []string          `yaml:"ignore_patterns"`
+	Agent    types.AgentName   `yaml:"agent"`
+	Agents   []types.AgentName `yaml:"-"`
+	Commands Commands          `yaml:"commands"`
+	// Runtime selects repository toolchains from the trusted default branch.
+	Runtime        Runtime  `yaml:"runtime"`
+	IgnorePatterns []string `yaml:"ignore_patterns"`
 	// ProtectedPaths prevents automatic staging of dirty matching paths. It is
 	// trusted-only, regardless of allow_repo_commands, so a pushed branch cannot
 	// remove the maintainer's protection from its own fixes.
@@ -647,6 +649,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	type repoConfigRaw struct {
 		Agent                  agentList    `yaml:"agent"`
 		Commands               Commands     `yaml:"commands"`
+		Runtime                Runtime      `yaml:"runtime"`
 		IgnorePatterns         []string     `yaml:"ignore_patterns"`
 		ProtectedPaths         []string     `yaml:"protected_paths"`
 		AllowRepoCommands      bool         `yaml:"allow_repo_commands"`
@@ -671,6 +674,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	c.Agent = firstAgent(raw.Agent)
 	c.Agents = copyAgents(raw.Agent)
 	c.Commands = raw.Commands
+	c.Runtime = raw.Runtime
 	c.IgnorePatterns = raw.IgnorePatterns
 	c.ProtectedPaths = raw.ProtectedPaths
 	c.AllowRepoCommands = raw.AllowRepoCommands
@@ -899,6 +903,7 @@ type Config struct {
 	Eval                      Eval
 	Worktree                  Worktree
 	Commands                  Commands
+	Runtime                   Runtime
 	CommandOverrides          map[string]CommandOverride
 	// ReviewAgentTimeoutTightened is set when the trusted repository's
 	// review.agent_timeout cut the Review budget below the global one. It is
@@ -3046,6 +3051,9 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
+	if err := cfg.Runtime.Validate(); err != nil {
+		return nil, fmt.Errorf("parse repo config: %w", err)
+	}
 	if err := validateCommitRaw(cfg.Commit); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
@@ -3274,6 +3282,7 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 	}
 	effective := *pushed
 	if trusted != nil {
+		effective.Runtime = trusted.Runtime
 		effective.Document = trusted.Document
 		effective.ProtectedPaths = append([]string(nil), trusted.ProtectedPaths...)
 		// review.path_instructions steers the gate agent that reviews the pushed
@@ -3368,6 +3377,7 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		effective.PR.PublishIntent = trusted.PR.PublishIntent
 		effective.PR.Appendix = trusted.PR.Appendix
 	} else {
+		effective.Runtime = Runtime{}
 		effective.Document = DocumentRaw{}
 		effective.ProtectedPaths = nil
 		effective.Review = ReviewRaw{}
@@ -4037,6 +4047,7 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 		Eval:           global.Eval,
 		Worktree:       global.Worktree,
 		Commands:       repo.Commands,
+		Runtime:        repo.Runtime,
 		Gates:          copyGates(repo.Gates),
 		IgnorePatterns: repo.IgnorePatterns,
 		ProtectedPaths: repo.ProtectedPaths,

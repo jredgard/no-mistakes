@@ -8,7 +8,7 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` and `gates[].command` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor` and `devin`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `review.conversation`, `review.path_instructions`, `review.agent_timeout`, `gates`, `auto_fix.gates`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `ci.review_bot_comments`, `ci.rebase_behind`, `ci.carry_review_on_replay`, `ci.release_after_checks_pass`, `rebase.strategy`, `test.prepare`, `test.base_attribution`, `test.instructions`, `test.allow_approve_over_failure`, `test.evidence.branch`, `pr.template`, `pr.publish_intent`, and `pr.appendix` only from that trusted copy.
+The daemon also reads `runtime`, `document.instructions`, `review.conversation`, `review.path_instructions`, `review.agent_timeout`, `gates`, `auto_fix.gates`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `ci.review_bot_comments`, `ci.rebase_behind`, `ci.carry_review_on_replay`, `ci.release_after_checks_pass`, `rebase.strategy`, `test.prepare`, `test.base_attribution`, `test.instructions`, `test.allow_approve_over_failure`, `test.evidence.branch`, `pr.template`, `pr.publish_intent`, and `pr.appendix` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
@@ -345,6 +345,28 @@ If a format requires `{{.Branch}}` but the branch pattern finds no identifier, P
 
 When this setting is omitted, no-mistakes keeps its default conventional commit title behavior, including release type guidance and title tightening.
 For a machine-local title convention that does not require repository configuration, see global [`repository_overrides`](/no-mistakes/reference/global-config/#repository_overrides).
+
+### runtime.node
+
+Select the Node runtime for repository commands and agent tools in Review, Test, Document, and Lint. This repository-only block comes **only from the trusted default-branch config**, regardless of `allow_repo_commands`.
+
+```yaml
+runtime:
+  node: "22.23.1"
+  # Optional: absolute path to an already installed node executable.
+  # node_path: /opt/node-v22.23.1/bin/node
+```
+
+| Field | Type | Default |
+| --- | --- | --- |
+| `runtime.node` | Exact stable version string, optionally prefixed with `v` | Unset (discover repository pin) |
+| `runtime.node_path` | Absolute path to `node` or `node.exe`, requires `runtime.node` | Unset (discover installed runtime) |
+
+Selection order is `runtime.node`, the root `.node-version`, the root `.nvmrc`, then the root `package.json`'s `engines.node`. A higher-priority pin that is empty, unreadable, invalid, or unavailable fails the step; it never falls through to another pin or a mismatching host Node. Repository metadata is read from the run worktree, so a change to the project's runtime pin is validated under that pin. No pin leaves the inherited environment unchanged.
+
+no-mistakes searches installed nvm, fnm, and Volta versions, respecting `NVM_DIR` (`NVM_HOME` on Windows), `FNM_DIR`, `VOLTA_HOME`, and their standard installation locations. It can also use a matching `node` already on the inherited absolute PATH. It verifies the executable's actual `--version`, then prepends its directory to PATH for every command and agent turn in that step, including dependency preparation, additional local checks, and Test's base-attribution commands. Each step log records the selected version, pin source, and executable. Selection never installs Node or changes a manager's default or the daemon's environment.
+
+Discovery accepts stable numeric versions, partial versions (`22`, `22.23`), `x`/`*` wildcards, `^`/`~` ranges, comparator sets (`>=22.23.1 <23`), and `||` alternatives. Ranges choose the newest matching installed manager version. Manager aliases such as `lts/*`, prereleases, and other range syntax are refused with instructions to set an exact `runtime.node`. Use an exact pin for reproducible validation. An explicit `node_path` must itself report the requested version; it never falls through to manager discovery.
 
 ### commands.prepare
 
@@ -1118,6 +1140,10 @@ Recorded reason that opts this repository into letting the `PR must be raised vi
 Off by default. When a Test step is approved while `commands.test` exited non-zero, no-mistakes records that as an override on the step and copies it onto the PR attestation as `steps[].override_reason`. The required check then refuses that attestation unless this field is a non-empty reason, which is copied into the attestation as `allow_test_command_override`.
 
 Like `no_ci`, this field weakens a merge gate, so it is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`, regardless of `allow_repo_commands`. A contributor's pushed branch cannot waive the configured-test check that certifies it. The string is the recorded reason; whitespace-only is treated as unset.
+
+#### Supported-runtime exceptions
+
+When a suite fails only under the host's Node version, configure [`runtime.node`](#runtimenode) or use the repository's `.node-version`, `.nvmrc`, or `engines.node` pin and install a matching runtime on the runner. The supported-runtime exception is no longer needed when the pin is honored: Test runs the configured command under the repository's supported Node version. A missing installation fails with an actionable runtime error; it does not silently run the host version or grant an exception. Remove a runtime-only `test.allow_approve_over_failure` reason once validation passes under the honored pin.
 
 ### test.evidence
 

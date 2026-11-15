@@ -34,7 +34,7 @@ func prepareRepositoryRuntime(sctx *pipeline.StepContext) (func(), error) {
 	if err != nil {
 		return restore, fmt.Errorf("Node pin %q from %s: %w; set runtime.node to an exact installed version", pin, source, err)
 	}
-	env := stepEnvironment(sctx)
+	env := pipelineCommandEnvironment(sctx)
 	if env == nil {
 		env = os.Environ()
 	}

@@ -76,14 +76,14 @@ Rewriting an existing PR's title or body (the attestation rebind before a push, 
 
 ### Multiple GitHub or GitLab identities
 
-If one daemon serves repositories that require non-overlapping accounts, give each account an isolated CLI config directory and use account-specific host aliases in repository remotes, for example `git@github-personal:you/project.git`. Then map those raw host tokens with global [`forge_profiles`](/no-mistakes/reference/global-config/#forge_profiles). The reference owns the configuration, validation, compatibility, and fail-closed routing contract.
+If one daemon serves repositories that require non-overlapping accounts, give each account an isolated CLI config directory and use account-specific host aliases in repository remotes, for example `git@github-personal:you/project.git`. Then map those raw host tokens with global [`forge_profiles`](/no-mistakes/reference/global-config/#forge_profiles). When the accounts are already signed in to one gh configuration, a GitHub profile keyed by `host/owner` with `gh_user` selects the login per repository owner instead, with no extra config directory or alias. The reference owns the configuration, validation, compatibility, and fail-closed routing contract.
 
 **What you get:**
 
 - PR creation and update on pushes
 - CI polling follows the [CI step lifecycle](/no-mistakes/reference/pipeline-steps/#ci)
 - Failed job log fetching (`gh run view --log-failed`) for the CI auto-fix step
-- A red Greptile check parked as `ask-user` CI findings carrying its unresolved review-thread comments, which are also supplied to CI repair prompts (a green or not-yet-registered one too under [`ci.review_bot_comments: always`](/no-mistakes/reference/repo-config/#cireview_bot_comments)); see the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci) for filtering and prompt-safety details
+- A red Greptile check, or a CodeRabbit check opted in through [`ci.required_reviews`](/no-mistakes/reference/repo-config/#cirequired_reviews), parked as `ask-user` CI findings carrying its unresolved review-thread comments, which are also supplied to CI repair prompts (a green or not-yet-registered one too under [`ci.review_bot_comments: always`](/no-mistakes/reference/repo-config/#cireview_bot_comments)); see the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci) for filtering and prompt-safety details
 - PR mergeability polling, and agent-driven resolution when the provider reports an actual merge conflict
 
 ### GitHub fork contributions
@@ -96,8 +96,7 @@ git remote set-url origin git@github.com:parent-owner/repo.git
 no-mistakes init --fork-url git@github.com:your-user/repo.git
 ```
 
-With this setup, pipeline pushes update the fork, including CI repairs whether they are published immediately or first revalidated under [`ci.revalidate_repairs`](/no-mistakes/reference/repo-config/#cirevalidate_repairs), while the PR and CI steps stay scoped to the parent repository.
-The GitHub PR step opens PRs with a fork-qualified head such as `your-user:feature-branch`.
+The [Push](/no-mistakes/reference/pipeline-steps/#push) and [PR](/no-mistakes/reference/pipeline-steps/#pr) references own fork routing, including CI repairs under [`ci.revalidate_repairs`](/no-mistakes/reference/repo-config/#cirevalidate_repairs). For a different integration project, see [`--base-remote`](/no-mistakes/reference/cli/#other-run-options).
 Re-running `no-mistakes init` later preserves the stored fork URL unless you pass a new `--fork-url`.
 
 Fork routing currently requires both `origin` and `--fork-url` to be GitHub remotes with owner/repo paths.
@@ -137,7 +136,7 @@ When no-mistakes updates an existing merge request, it reads the live title and 
 
 Install [`forgejo-axi`](https://github.com/escidmore/forgejo-axi) and make it available on `PATH`. It currently installs from source with Node.js 20 or newer; set [`forgejo_axi_path`](/no-mistakes/reference/global-config/#forgejo_axi_path) when the executable lives elsewhere.
 
-Give the daemon a Forgejo token through either the generic `FORGEJO_TOKEN` variable or forgejo-axi's host-scoped token variable. Configure `FORGEJO_BASE_URL` for SSH origins and unrecognized self-hosted HTTPS hostnames. When the instance serves SSH from another hostname - its own `SSH_DOMAIN` setting, for example `ssh.forgejo.example` beside a web host of `forgejo.example` - also set [`FORGEJO_SSH_DOMAIN`](/no-mistakes/reference/environment/#forgejo_ssh_domain) to that hostname, or the SSH origin cannot be matched to the configured instance. The [environment reference](/no-mistakes/reference/environment/#forgejo_base_url) owns the exact base-URL and host-key rules.
+Give the daemon a Forgejo token through either the generic `FORGEJO_TOKEN` variable or forgejo-axi's host-scoped token variable. Configure the integration remote's instance URL with [`FORGEJO_BASE_URL`](/no-mistakes/reference/environment/#forgejo_base_url) and any separate SSH hostname with [`FORGEJO_SSH_DOMAIN`](/no-mistakes/reference/environment/#forgejo_ssh_domain), following the detection rules in those references.
 
 Verify without mutating a deployed Forgejo instance:
 
@@ -214,8 +213,9 @@ well as their SSH forms (`git@ssh.dev.azure.com:v3/...`).
   [`pr.template`](/no-mistakes/reference/repo-config/#prtemplate) for
   author-preserving publication and its provider limits.
 - CI status polling - Azure branch policy evaluations (build validation and
-  status checks) are read via `az repos pr policy list` until the PR is
-  completed, abandoned, or the configured `ci_timeout` idle window elapses
+  status checks) are read via `az repos pr policy list` while the CI monitor is
+  active; see the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci)
+  for its lifecycle and handoff controls
 - Merge-conflict polling and auto-fix from the PR's `mergeStatus`
 - Failed build task and job logs for the CI auto-fix step, via the build timeline and logs REST endpoints using the existing `az` authentication
 
@@ -283,8 +283,7 @@ origin auth status
 - PR creation and update (`origin pr create` / `origin pr edit`). The Origin CLI
   defaults new changes to draft; no-mistakes always passes `--status` explicitly
   (`open` unless `providers.origin.draft_pull_requests` is true).
-- CI check polling through `origin pr checks` until the PR is merged or closed,
-  or the configured `ci_timeout` idle window elapses.
+- CI check polling through `origin pr checks` while the monitor is active; see the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci) for its lifecycle.
 - Mergeability polling from `origin pr view --json mergeability`, and
   merge-conflict auto-fix when Origin reports `hasMergeConflicts`, conflicted
   paths, or a conflict verdict under the nested `mergeability.mergeability`.
@@ -318,6 +317,8 @@ The fork owner extracted from the fork URL keeps the plain `owner/name` form bec
 Self-hosted GitLab is detected out of the box even when the hostname carries no `gitlab` marker (for example `git.example.com`).
 When the hostname is not obviously GitLab, `no-mistakes` consults glab's configured hosts (`config.yml`, honoring `GLAB_CONFIG_DIR` then `XDG_CONFIG_HOME/glab-cli`, then `~/.config/glab-cli`) and treats the upstream as GitLab if its host appears there as a configured host or `api_host`.
 Running `glab auth login --hostname your-gitlab.example.com` is enough to make detection succeed; if glab is not configured for the host, detection fails closed and the upstream is treated as unsupported.
+
+If GitLab serves SSH and web/API traffic on different hosts, configure glab's global `api_host` for the Git remote's host. See the [MR URL validation contract](/no-mistakes/reference/pipeline-steps/#pr) for how existing-MR discovery and review-comment reads authorize the alternate web host.
 
 The GitLab backend is pinned against `glab v1.5x`. Self-hosted detection and the merge-request and CI steps rely on its current flag and API surface, so keep `glab` reasonably up to date.
 

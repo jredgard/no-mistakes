@@ -3,7 +3,10 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"strings"
+
+	"github.com/kunchenguid/no-mistakes/internal/integration"
 )
 
 // Repo represents a registered repository.
@@ -18,6 +21,18 @@ type Repo struct {
 	// URLsVerified is run-scoped, in-memory evidence that the URL fields were
 	// just validated against the working clone. It is never persisted.
 	URLsVerified bool `json:"-"`
+	// Integration is a run-owned view, never persisted on the registration.
+	Integration *integration.Destination `json:"-"`
+}
+
+const repoReadColumns = "id, working_path, upstream_url, fork_url, default_branch, created_at"
+
+func repoScanTargets(r *Repo) []any {
+	return []any{&r.ID, &r.WorkingPath, &r.UpstreamURL, &r.ForkURL, &r.DefaultBranch, &r.CreatedAt}
+}
+
+func (d *DB) repoColumns() (string, error) {
+	return d.readProjection("repos", repoReadColumns, repoScanTargets(&Repo{})...)
 }
 
 // PushURL returns the remote URL that should receive branch updates.
@@ -111,8 +126,12 @@ func (d *DB) RepoWorkingPaths() ([]string, error) {
 
 // GetRepos returns every authoritative repository record ordered by ID.
 func (d *DB) GetRepos() ([]*Repo, error) {
+	columns, err := d.repoColumns()
+	if err != nil {
+		return nil, err
+	}
 	rows, err := d.sql.Query(
-		`SELECT id, working_path, upstream_url, COALESCE(fork_url, ''), default_branch, created_at FROM repos ORDER BY id`,
+		`SELECT ` + columns + ` FROM repos ORDER BY id`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("get repos: %w", err)
@@ -122,7 +141,7 @@ func (d *DB) GetRepos() ([]*Repo, error) {
 	var repos []*Repo
 	for rows.Next() {
 		r := &Repo{}
-		if err := rows.Scan(&r.ID, &r.WorkingPath, &r.UpstreamURL, &r.ForkURL, &r.DefaultBranch, &r.CreatedAt); err != nil {
+		if err := rows.Scan(repoScanTargets(r)...); err != nil {
 			return nil, fmt.Errorf("scan repo: %w", err)
 		}
 		repos = append(repos, r)
@@ -135,10 +154,14 @@ func (d *DB) GetRepos() ([]*Repo, error) {
 
 // GetRepo returns a repo by ID.
 func (d *DB) GetRepo(id string) (*Repo, error) {
+	columns, err := d.repoColumns()
+	if err != nil {
+		return nil, err
+	}
 	r := &Repo{}
-	err := d.sql.QueryRow(
-		`SELECT id, working_path, upstream_url, COALESCE(fork_url, ''), default_branch, created_at FROM repos WHERE id = ?`, id,
-	).Scan(&r.ID, &r.WorkingPath, &r.UpstreamURL, &r.ForkURL, &r.DefaultBranch, &r.CreatedAt)
+	err = d.sql.QueryRow(
+		`SELECT `+columns+` FROM repos WHERE id = ?`, id,
+	).Scan(repoScanTargets(r)...)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -148,19 +171,69 @@ func (d *DB) GetRepo(id string) (*Repo, error) {
 	return r, nil
 }
 
-// GetRepoByPath returns a repo by its working path.
+// GetRepoByPath returns the repo registered for the directory workingPath
+// names. An exact match on the stored path wins. When there is none, the lookup
+// falls back to filesystem identity (os.SameFile), so one checkout keeps one
+// repository identity across spellings of its path: a case variant on a
+// case-insensitive volume, or a symlinked path. Two directories that merely
+// differ in case on a case-sensitive volume are different files and stay
+// distinct. A path that cannot be stat'ed matches nothing but itself.
 func (d *DB) GetRepoByPath(workingPath string) (*Repo, error) {
-	r := &Repo{}
-	err := d.sql.QueryRow(
-		`SELECT id, working_path, upstream_url, COALESCE(fork_url, ''), default_branch, created_at FROM repos WHERE working_path = ?`, workingPath,
-	).Scan(&r.ID, &r.WorkingPath, &r.UpstreamURL, &r.ForkURL, &r.DefaultBranch, &r.CreatedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil
+	columns, err := d.repoColumns()
+	if err != nil {
+		return nil, err
 	}
+	r := &Repo{}
+	err = d.sql.QueryRow(
+		`SELECT `+columns+` FROM repos WHERE working_path = ?`, workingPath,
+	).Scan(repoScanTargets(r)...)
+	if err == nil {
+		return r, nil
+	}
+	if err != sql.ErrNoRows {
+		return nil, fmt.Errorf("get repo by path: %w", err)
+	}
+	return d.getRepoBySameFile(workingPath)
+}
+
+// getRepoBySameFile scans the registered repos, oldest first, for one whose
+// working path is the same directory as workingPath. Rows registered under
+// different spellings of one directory therefore resolve to the oldest, in
+// insertion order (rowid) when created_at ties, rather than to whichever row
+// sorts first by its path-derived id.
+func (d *DB) getRepoBySameFile(workingPath string) (*Repo, error) {
+	columns, err := d.repoColumns()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := d.sql.Query(
+		`SELECT ` + columns + ` FROM repos ORDER BY created_at, rowid`,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("get repo by path: %w", err)
 	}
-	return r, nil
+	defer rows.Close()
+
+	var target os.FileInfo
+	for rows.Next() {
+		r := &Repo{}
+		if err := rows.Scan(repoScanTargets(r)...); err != nil {
+			return nil, fmt.Errorf("scan repo: %w", err)
+		}
+		if target == nil {
+			// Resolved lazily so an empty table costs no filesystem call.
+			if target, err = os.Stat(workingPath); err != nil {
+				return nil, nil
+			}
+		}
+		if info, err := os.Stat(r.WorkingPath); err == nil && os.SameFile(target, info) {
+			return r, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("get repo by path: %w", err)
+	}
+	return nil, nil
 }
 
 // ReplaceRepoURLs atomically replaces both registered repository URLs and

@@ -36,6 +36,10 @@ func TestCIStep_NoChangeFixRepollsGreenPublishedHead(t *testing.T) {
 			checks := []string{
 				`[{"name":"build","bucket":"fail","state":"FAILURE","completedAt":"2026-10-13T12:00:00Z"}]`,
 			}
+			// Upstream revalidates selected targets immediately before the
+			// fixer. Keep that observation failing so this exercises the
+			// fork's post-fixer re-poll rather than the upstream stale-target skip.
+			checks = append(checks, checks[0])
 			wantPolls := 1
 			if tc.pending {
 				checks = append(checks, `[{"name":"build","bucket":"pending","state":"PENDING"}]`)
@@ -100,6 +104,7 @@ func TestCIStep_NoChangeConclusionParksFreshFailures(t *testing.T) {
 	}}
 	sctx := stepstest.NewTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = stepstest.FakeCIGHSequence(t, "OPEN", []string{
+		`[{"name":"old build","bucket":"fail","state":"FAILURE","completedAt":"2026-10-13T12:00:00Z"}]`,
 		`[{"name":"old build","bucket":"fail","state":"FAILURE","completedAt":"2026-10-13T12:00:00Z"}]`,
 		`[{"name":"current build","bucket":"fail","state":"FAILURE"}]`,
 	})

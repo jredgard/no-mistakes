@@ -214,7 +214,7 @@ func TestPRDescriptionV184Golden(t *testing.T) {
 					}
 				}
 			}
-			pipelineMD, risk, _ := (&PRStep{}).buildPipelineSection(sctx, provider)
+			pipelineMD, risk, _, _ := (&PRStep{}).buildPipelineSection(sctx, provider)
 			for _, ending := range []struct{ name, value string }{{"LF", "\n"}, {"CRLF", "\r\n"}} {
 				t.Run(ending.name, func(t *testing.T) {
 					narrative := strings.ReplaceAll("## What Changed\n\n- Declare the concrete quotation detail response schema.\n- Verify the generated OpenAPI response contract.", "\n", ending.value)

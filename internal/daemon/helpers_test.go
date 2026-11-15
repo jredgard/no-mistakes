@@ -18,10 +18,25 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/kunchenguid/no-mistakes/internal/winproc"
 )
 
 func TestMain(m *testing.M) {
 	switch os.Getenv("NM_DAEMON_HELPER_PROCESS") {
+	case "integration-remote":
+		p := paths.WithRoot(os.Getenv("NM_HOME"))
+		database, err := db.Open(p.DB())
+		if err == nil {
+			err = RunWithOptions(p, database, func() []pipeline.Step {
+				return integrationRecoverySteps()
+			})
+			_ = database.Close()
+		}
+		if err != nil {
+			_, _ = os.Stderr.WriteString(err.Error() + "\n")
+			os.Exit(2)
+		}
+		os.Exit(0)
 	case "1":
 		if capturePath := os.Getenv("NM_CAPTURE_NM_HOME_FILE"); capturePath != "" {
 			// Atomic rename so a poller that treats "file exists" as "content
@@ -45,11 +60,43 @@ func TestMain(m *testing.M) {
 			os.Exit(2)
 		}
 		os.Exit(0)
+	case "restartable":
+		// RunRestartable as `daemon run` calls it: a scheduled restart
+		// executes this test binary again with the same environment.
+		if err := RunRestartable(); err != nil {
+			_, _ = os.Stderr.WriteString(err.Error() + "\n")
+			os.Exit(2)
+		}
+		os.Exit(0)
 	case "bootstrap-sink":
 		if err := RunBootstrapLogSink(); err != nil {
 			_, _ = os.Stderr.WriteString(err.Error() + "\n")
 			os.Exit(2)
 		}
+		os.Exit(0)
+	case "run-stdio":
+		// The run_stdio tests start this with prepared standard handles and
+		// look for each marker where daemon run's output must land.
+		if err := PrepareRunStdio(); err != nil {
+			os.Exit(3)
+		}
+		_, _ = os.Stdout.WriteString("stdout-marker\n")
+		_, _ = os.Stderr.WriteString("stderr-marker\n")
+		println("runtime-stderr-marker") // the runtime's own stderr handle, as crash output uses
+		exe, err := os.Executable()
+		if err != nil {
+			os.Exit(4)
+		}
+		child := exec.Command(exe)
+		child.Env = upsertEnv(os.Environ(), "NM_DAEMON_HELPER_PROCESS", "stderr-marker")
+		child.Stderr = os.Stderr // as the bootstrap log-sink inherits it
+		winproc.Harden(child)
+		if err := child.Run(); err != nil {
+			os.Exit(5)
+		}
+		os.Exit(0)
+	case "stderr-marker":
+		_, _ = os.Stderr.WriteString("child-stderr-marker\n")
 		os.Exit(0)
 	case "capture-output":
 		p := paths.WithRoot(os.Getenv("NM_HOME"))
@@ -95,6 +142,9 @@ func TestMain(m *testing.M) {
 	globalConfig := filepath.Join(globalConfigDir, "gitconfig")
 	os.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
 	code := m.Run()
+	if integrationCLI.dir != "" {
+		os.RemoveAll(integrationCLI.dir)
+	}
 	os.RemoveAll(globalConfigDir)
 	os.Exit(code)
 }
@@ -328,6 +378,17 @@ func setupTestGitRepo(t *testing.T, p *paths.Paths, d *db.DB, repoID string) (*d
 	_ = ctx
 
 	return repo, headSHA
+}
+
+func commitTrustedRepoConfig(t *testing.T, repo *db.Repo, contents string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(repo.WorkingPath, ".no-mistakes.yaml"), []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repo.WorkingPath, "add", ".no-mistakes.yaml")
+	gitCmd(t, repo.WorkingPath, "commit", "-m", "configure trusted test policy")
+	gitCmd(t, repo.WorkingPath, "push", "gate", "HEAD:refs/heads/main")
+	return gitOutput(t, repo.WorkingPath, "rev-parse", "HEAD")
 }
 
 func gitCmd(t *testing.T, dir string, args ...string) {

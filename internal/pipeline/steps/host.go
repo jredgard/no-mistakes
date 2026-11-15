@@ -149,7 +149,11 @@ func buildHost(sctx *pipeline.StepContext, provider scm.Provider) (scm.Host, str
 			forkRepo = github.RepoSlug(sctx.Repo.ForkURL)
 		}
 		draft := sctx.Config != nil && sctx.Config.Providers.GitHub.DraftPullRequests
-		return github.NewWithFork(cmdFactory, func() bool { return stepCLIAvailable(sctx, provider) }, host, repo, forkRepo, draft), ""
+		gh := github.NewWithFork(cmdFactory, func() bool { return stepCLIAvailable(sctx, provider) }, host, repo, forkRepo, draft)
+		if sctx.Config != nil {
+			gh.WithRequiredReviews(sctx.Config.CI.RequiredReviews, sctx.Config.CI.RequiredReviewAppID)
+		}
+		return gh, ""
 	case scm.ProviderGitLab:
 		if sctx.Repo.ForkURL != "" {
 			// Fork MR routing for GitLab is intentionally not half-wired.
@@ -158,13 +162,31 @@ func buildHost(sctx *pipeline.StepContext, provider scm.Provider) (scm.Host, str
 			return nil, "fork PR routing for GitLab is not implemented"
 		}
 		draft := sctx.Config != nil && sctx.Config.Providers.GitLab.DraftPullRequests
-		return gitlab.NewWithDraft(
-			cmdFactory,
+		gitlabFactory := cmdFactory
+		if sctx.Run.Integration != nil {
+			// glab's MR porcelain otherwise discovers origin from the cwd.
+			// GITLAB_REPO selects the repository for every command accepting
+			// --repo, without passing that flag to auth subcommands that lack it.
+			// See https://docs.gitlab.com/cli/configuration/.
+			targetHost := resolvedHost(sctx, sctx.Repo.UpstreamURL)
+			targetRepo := sctx.Repo.UpstreamURL
+			gitlabFactory = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+				cmd := cmdFactory(ctx, name, args...)
+				cmd.Env = append(cmd.Environ(), "GITLAB_HOST="+targetHost, "GITLAB_REPO="+targetRepo)
+				return cmd
+			}
+		}
+		host := gitlab.NewWithDraft(
+			gitlabFactory,
 			func() bool { return stepCLIAvailable(sctx, provider) },
 			resolvedHost(sctx, sctx.Repo.UpstreamURL),
 			gitlab.ProjectPath(sctx.Repo.UpstreamURL),
 			draft,
-		), ""
+		)
+		if sctx.Config != nil {
+			host.WithRequiredReviews(sctx.Config.CI.RequiredReviews, sctx.Config.CI.RequiredReviewBotID)
+		}
+		return host, ""
 	case scm.ProviderBitbucket:
 		if sctx.Repo.ForkURL != "" {
 			// Fork PR routing for Bitbucket is intentionally not half-wired.

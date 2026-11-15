@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/integration"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -111,6 +112,54 @@ func TestCancelledPublishedRecoveryFailsClosed(t *testing.T) {
 				if _, err := os.Stat(filepath.Join(f.local, "dirty.txt")); err != nil {
 					t.Fatal(err)
 				}
+			}
+		})
+	}
+}
+
+func TestCancelledPublishedRecoveryKeepsTheSelectedIntegrationRemote(t *testing.T) {
+	for _, priorStatus := range []types.RunStatus{types.RunCompleted, types.RunChecksPassed, types.RunHandedOff} {
+		t.Run(string(priorStatus), func(t *testing.T) {
+			t.Parallel()
+			f := newSyncFixture(t)
+			if err := f.db.UpdateRunStatus(f.run.ID, priorStatus); err != nil {
+				t.Fatal(err)
+			}
+			mustRun(t, f.local, "remote", "add", "custom", f.remote)
+			pin := &integration.Destination{Remote: "custom", URL: f.remote, TransportURL: f.remote, DefaultBranch: "main", Key: "cancelledabcdefghijklmnop"}
+			var err error
+			f.run, err = f.db.InsertRunWithDestination(f.repo.ID, "feature/sync", f.old, f.base, nil, "", "", "", "", false, nil, db.RunPRText{}, nil, pin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.db.UpdateRunPushBinding(f.run.ID, db.PushBinding{HeadSHA: f.pushed, TargetKind: "upstream", TargetFingerprint: TargetFingerprint(f.remote), Ref: "refs/heads/feature/sync"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.db.UpdateRunStatusWithVerifiedHead(f.run.ID, types.RunCancelled, f.pushed); err != nil {
+				t.Fatal(err)
+			}
+			mustRun(t, f.local, "fetch", f.remote, "refs/heads/feature/sync")
+			mustRun(t, f.local, "merge", "--ff-only", f.pushed)
+			stale, err := f.db.GetRun(f.run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changedPin := *stale.Integration
+			changedPin.Remote = "other"
+			stale.Integration = &changedPin
+			if returned, err := f.db.ReturnCancelledPublishedCustody(stale, f.repo); err != nil || returned {
+				t.Fatalf("changed integration pin returned custody: %t, %v", returned, err)
+			}
+			got := f.service.Recover(f.ctx, false)
+			if !got.Recovered || got.Changed || got.State != StateUserOwned {
+				t.Fatalf("selected-remote custody recovery = %+v", got)
+			}
+			if head := mustRun(t, f.local, "rev-parse", "HEAD"); head != f.pushed {
+				t.Fatalf("local head moved: %s", head)
+			}
+			stored, err := f.db.GetRun(f.run.ID)
+			if err != nil || stored.Integration == nil || *stored.Integration != *pin || stored.CustodyReturnedAt == nil {
+				t.Fatalf("recovery lost pinned destination: %+v, %v", stored, err)
 			}
 		})
 	}

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -29,9 +30,11 @@ var baseRoleFor = map[string]string{
 	RoleFixerAfterRound:    RoleFixer,
 }
 
-// ReviewAgent pins one review-loop role to an explicit harness. Empty model or
-// effort inherits agent_config for that harness; native argument overrides win.
+// ReviewAgent selects one review-loop role. For configured entries, empty model
+// or effort inherits agent_config for that harness. Native argument overrides win.
 type ReviewAgent struct {
+	// Pinned is runtime-only and cannot be selected through configuration.
+	Pinned bool            `yaml:"-"`
 	Agent  types.AgentName `yaml:"agent"`
 	Model  string          `yaml:"model"`
 	Effort agentcfg.Effort `yaml:"effort"`
@@ -43,6 +46,9 @@ type ReviewAgent struct {
 	// omitted key, so a value the documented contract rejects fails closed
 	// instead of being read as the default.
 	AfterRound *int `yaml:"after_round"`
+	// Fallback is an explicit, ordered set of independent reviewer profiles.
+	// Only reviewer roles accept it, and only quota exhaustion advances it.
+	Fallback []ReviewAgent `yaml:"fallback"`
 }
 
 // TakesOverFromRound is the first 1-based round an *_after_round entry serves.
@@ -63,6 +69,17 @@ func validateReviewAgents(roles map[string]ReviewAgent) error {
 		}
 		if err := agentcfg.Validate(entry.Agent, agentcfg.Profile{Model: strings.TrimSpace(entry.Model), Effort: entry.Effort}); err != nil {
 			return fmt.Errorf("invalid review_agents.%s: %w", role, err)
+		}
+		if len(entry.Fallback) > 0 && role != RoleReviewer && role != RoleReviewerAfterRound {
+			return fmt.Errorf("review_agents.%s does not accept fallback; only reviewer roles do", role)
+		}
+		for i, candidate := range entry.Fallback {
+			if candidate.AfterRound != nil || len(candidate.Fallback) > 0 {
+				return fmt.Errorf("review_agents.%s.fallback[%d] accepts only agent, model and effort", role, i)
+			}
+			if err := validateReviewAgents(map[string]ReviewAgent{RoleReviewer: candidate}); err != nil {
+				return fmt.Errorf("review_agents.%s.fallback[%d]: %w", role, i, err)
+			}
 		}
 		if _, isOverlay := baseRoleFor[role]; !isOverlay {
 			if entry.AfterRound != nil {
@@ -108,5 +125,16 @@ func (c *Config) ForReviewAgent(entry ReviewAgent) *Config {
 	}
 	role.AgentConfig = map[string]agentcfg.Profile{string(entry.Agent): profile}
 	role.ReviewAgents = nil
+	if entry.Pinned {
+		// A later global edit cannot displace a run's typed reviewer selection.
+		role.AgentArgsOverride = maps.Clone(c.AgentArgsOverride)
+		delete(role.AgentArgsOverride, string(entry.Agent))
+		if entry.Agent == types.AgentPi {
+			if role.AgentArgsOverride == nil {
+				role.AgentArgsOverride = make(map[string][]string)
+			}
+			role.AgentArgsOverride[string(entry.Agent)] = (&agentcfg.PiProfile{Model: entry.Model, Effort: entry.Effort}).PinnedBaseArgs(nil)
+		}
+	}
 	return &role
 }

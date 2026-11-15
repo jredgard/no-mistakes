@@ -89,6 +89,7 @@ ci:
   rebase_behind: false
   carry_review_on_replay: false
   release_after_checks_pass: false
+  required_reviews: []
 
 rebase:
   strategy: rebase # or: merge
@@ -111,11 +112,16 @@ intent:
   slack_days: 3
   disabled_readers: []
   # publish_intent: false # Keep the generated Intent section out of PR bodies by default
+  # check:
+  #   mode: warn # off (default) | warn | reject
+  #   terms: ["internal project label"]
+  #   patterns: ['(?i)run-[a-z0-9-]+']
 
 test:
   evidence:
     store_in_repo: false
     attach_media: true
+    compact: true
     dir: .no-mistakes/evidence
     branch: no-mistakes/evidence
     commit_message: "no-mistakes: evidence for {{.Branch}} (run {{.RunID}})"
@@ -167,7 +173,7 @@ After resolving `auto`, entries that resolve to the same ACP target are deduplic
 If no entry is available, the gate fails before its first pipeline step.
 If a pipeline invocation fails because that agent process cannot start or exits with an error, no-mistakes retries that invocation with the next available fallback.
 Fallback candidates share the invocation's existing bounded context and use only its remaining time; once that context expires or is cancelled, no further candidate is announced or started.
-Structured findings and schema/output validation problems do not trigger fallback.
+Structured findings and validation failures in an agent's returned output do not trigger fallback. A recognized Codex provider rejection of the requested structured-output schema does trigger fallback.
 
 ### acpx_path
 
@@ -293,7 +299,7 @@ An entry may also declare `quota_provider`, the quota-axi provider ID used as ro
 
 `agent_config` is global-only. Like `agent_args_override`, it decides which model runs with your credentials, so an `agent_config` block in a repository's `.no-mistakes.yaml` is ignored. For first-class ACP aliases, `cursor` and `acp:cursor` share a profile, as do `devin` and `acp:devin`: the selected spelling's entry wins when both are configured; otherwise the other spelling's entry applies. This also applies to review-agent profiles.
 
-**Precedence for unpinned runs.** `agent_args_override` wins. Opt-in [per-run Pi profiles](#per-run-pi-profiles) have a separate, immutable selection contract. If a raw flag already pins a knob natively - for example, `-m`, `--model`, or a `-c`/`--config` assignment whose exact key is `model` or `model_reasoning_effort` for Codex, plus the other harnesses' `--effort`, `--reasoning-effort`, or `--thinking` forms - then `agent_config` does not emit its value for that knob. Text such as `model=` nested inside an unrelated option's value is not a pin. Any knob the raw flags leave alone still comes from `agent_config`, so adding `agent_config` to an existing configuration never changes the arguments that configuration already supplied:
+**Precedence for unpinned runs.** `agent_args_override` wins. Opt-in [per-run Pi profiles](#per-run-pi-profiles) and [reviewer profiles](#per-run-reviewer-profiles) have separate, immutable selection contracts. If a raw flag already pins a knob natively - for example, `-m`, `--model`, or a `-c`/`--config` assignment whose exact key is `model` or `model_reasoning_effort` for Codex, plus the other harnesses' `--effort`, `--reasoning-effort`, or `--thinking` forms - then `agent_config` does not emit its value for that knob. Text such as `model=` nested inside an unrelated option's value is not a pin. Any knob the raw flags leave alone still comes from `agent_config`, so adding `agent_config` to an existing configuration never changes the arguments that configuration already supplied:
 
 ```yaml
 agent_config:
@@ -305,6 +311,55 @@ agent_args_override:
     - -m
     - o3
 ```
+
+### Per-run reviewer profiles
+
+Choose a reviewer independently of the primary author/fixer:
+
+```sh
+no-mistakes axi run --intent "the user's goal" \
+  --reviewer codex --reviewer-model gpt-5.4 --reviewer-effort high
+```
+
+`--reviewer` requires an explicit harness with verified model and effort
+selection: `claude`, `codex`, `copilot`, `grok`, `opencode`, or `pi`.
+`cursor`, `devin`, every `acp:<target>`, `rovodev`, and `antigravity` cannot
+be pinned because they lack at least one of these mechanisms. Omitted model
+and effort fields inherit `agent_config` for the selected harness, and both
+must resolve before launch.
+Pinned reviewer model names are limited to 256 characters from
+`[A-Za-z0-9._-/]` and cannot start with `-`. A model valid in `agent_config`
+may still be refused as a pinned reviewer, including `opus[1m]`, Bedrock IDs
+containing `:`, and OpenCode IDs such as `ollama/qwen3:8b`.
+Pi reviewers also require the provider-qualified model ID described under
+[per-run Pi profiles](#per-run-pi-profiles).
+Unsupported tuning, unavailable binaries, and raw `agent_args_override` for
+the selected reviewer harness are refused before an active run is cancelled.
+For ordinary and proof-mode launches, reviewer availability and trusted
+instruction-suppression policy are checked before a push changes private-gate
+refs or takes custody. An older daemon without reviewer-resolution support is
+refused before submission.
+Model availability and authentication remain the harness's responsibility.
+
+The resolved harness, model and effort are stored atomically in
+`runs.reviewer_profile` and cannot be replaced or cleared. They override
+`review_agents.reviewer`, `reviewer_after_round`, and the reviewer portion of a
+Pi run pin. The primary and fixer keep their existing selection. Each run has
+its own pin, so concurrent runs can choose different reviewers. Later global
+profiles, raw arguments and reviewer routing cannot replace it during recovery.
+Trusted instruction-suppression policy still applies, and a missing reviewer
+fails closed rather than falling back to the primary.
+
+Omit the reviewer flags to reattach. Explicit selections must match the stored
+pin, including on nonce replay and receipt claims. Retries preserve the pin and
+retain the ordinary retry configuration checks. `rerun` inherits the resolved
+reviewer unless `--reviewer` explicitly selects a replacement for the new run.
+A fresh `axi run` without reviewer flags uses current configuration, including
+any newly requested Pi profile, and never inherits the previous run's reviewer
+pin, even when the push is up to date. Requested profiles are visible in
+[`axi status`](/no-mistakes/reference/cli/#no-mistakes-axi-status) and
+[`stats --run <id>`](/no-mistakes/reference/cli/#no-mistakes-stats).
+This does not infer model families or select a fallback reviewer.
 
 ### Per-run Pi profiles
 
@@ -324,9 +379,11 @@ Availability, authentication, and model-specific reasoning support remain Pi's
 responsibility. For optional quota evidence at run start, see
 [quota-aware routing](#quota_routing).
 
-A pin applies to **every pipeline duty**, including reviewer and fixer roles.
+A pin applies to **every pipeline duty**, including reviewer and fixer roles,
+unless an explicit per-run reviewer profile overrides the reviewer.
 The effective agent selection must be Pi-only (no `auto`, non-Pi fallbacks, or
-non-Pi `review_agents`). Under the default trust policy, a nonempty `agent` in
+non-Pi `review_agents`, except reviewer entries replaced by an explicit per-run
+reviewer). Under the default trust policy, a nonempty `agent` in
 the freshly fetched, trusted default-branch `.no-mistakes.yaml` replaces the
 global scalar or fallback list for this check, just as it does for an ordinary
 run. This lets one project opt into Pi profiles with trusted `agent: pi` while
@@ -344,8 +401,8 @@ the run pin. Native `--model`, `--provider`, `--models`,
 rather than combining two selection mechanisms.
 
 The daemon resolves the values once and stores `runs.pi_profile` atomically
-with run creation. That field cannot be changed or cleared. Each invocation,
-retry, fresh review, resumed fixer, and daemon recovery uses that pin; later
+with run creation. That field cannot be changed or cleared. The pin survives
+retries and daemon recovery. Later
 global model, effort, agent-chain, role, or raw selection-flag changes cannot
 replace it. Recovery still enforces trusted repository policies and refuses
 unusable configuration or a missing Pi binary rather than switching harnesses.
@@ -370,7 +427,9 @@ submission, so an older daemon cannot silently launch it without a pin.
 ### review_agents
 
 Optional, **global-only** harness and model/effort overrides for the review loop.
-Repository `.no-mistakes.yaml` cannot set these profiles. Omitted roles keep the
+Repository `.no-mistakes.yaml` cannot set these profiles; a matching
+[`repository_overrides`](#machine-local-review-agents) entry in this file can
+replace individual roles for one repository. Omitted roles keep the
 normal `agent` selection and fallback chain; other pipeline steps are unchanged.
 
 ```yaml
@@ -392,6 +451,34 @@ Model and effort are optional and inherit `agent_config` for that harness when
 empty. Nonempty role values override that profile, but native
 `agent_args_override` flags still win. Model availability, credentials, and
 supported effort levels remain the harness/provider's responsibility.
+
+Reviewer roles (`reviewer` and `reviewer_after_round`) also accept an ordered,
+explicit `fallback` list. Each entry requires `agent` and accepts `model` and
+`effort` with the same inheritance and native-argument precedence as the role:
+
+```yaml
+review_agents:
+  reviewer:
+    agent: codex
+    fallback:
+      - {agent: pi, model: openai-codex/gpt-5.4, effort: high}
+```
+
+Only recognized invocation-time provider quota exhaustion advances this list.
+Launch errors, transient failures, invalid review output, timeouts and cancellation
+do not. Each replacement receives the complete review prompt without a session,
+inside the invocation's existing timeout. Subsequent review and coverage turns
+using that role stay on its selected reviewer rather than retrying exhausted
+candidates. The base and later-round reviewer roles have separate fallback chains.
+If all configured reviewers exhaust their quota, review fails without approval.
+The fallback log names both configured candidates, including same-harness profiles.
+See [local invocation evidence](/no-mistakes/reference/environment/#what-stays-local-and-what-leaves-the-machine)
+for the recorded identities.
+An OpenCode turn that ran tools, or whose tool activity is unknown, cannot fall
+back to a fresh reviewer session.
+These candidates are independent reviewer instances and never fall back to the
+writer or fixer implicitly. `fallback` is operator-only, does not use quota routing,
+and accepts neither nested fallback lists nor `after_round`; fixer roles reject it.
 
 #### Later-round role overrides
 
@@ -436,8 +523,10 @@ Both roles can use the same harness with different models. Reviews and rereviews
 always run fresh; only review fixes reuse the fixer's session when
 `session_reuse` is enabled and the fixer supports it. These settings do not
 select the agents repairing tests, documentation, or CI. An opt-in
-[per-run Pi profile](#per-run-pi-profiles) supersedes these role values for
-that run. Eval capture strips these profiles so replay candidates remain
+[per-run Pi profile](#per-run-pi-profiles) supersedes these configured role
+values for that run. See [per-run reviewer profiles](#per-run-reviewer-profiles)
+for independent reviewer selection and its precedence over both mechanisms.
+Eval capture strips these profiles so replay candidates remain
 authoritative.
 
 ### agent_args_override
@@ -465,6 +554,9 @@ User-supplied flags are normally inserted ahead of no-mistakes' managed flags, s
 | `antigravity` | `--dangerously-skip-permissions`, `--print`, `--json-schema`, `--output-format`, `--conversation`, `-c`, `--continue` |
 
 For structured `codex` runs, no-mistakes also appends its own `--output-schema <tempfile>` after your overrides. Treat that flag as managed even though config validation does not currently reject it.
+
+The selected Codex profile/model's provider must accept that schema. A recognized provider schema rejection lets the next eligible configured fallback agent take over. Without one, the run stops with `codex structured-output incompatibility` and preserves the provider diagnostic. The Codex schema incompatibility is not retried by the adapter or by automatic crash retries. A Review or Test analyzer rerun restarts the agent chain, so Codex may be called again and fail fast before the fallback runs. Review is neither skipped nor retried without the schema. Select a compatible Codex profile/model or configure a different agent route, then rerun the pipeline so review can complete. A profile that works for plain prompts, such as Rebase, can still reject structured review requests.
+
 The Claude, Codex, Grok, Pi, and Antigravity session-control forms are reserved so no-mistakes can keep review-loop conversations deterministic: review turns stay session-free while the fixer keeps its own isolated durable session.
 
 Smart defaults:
@@ -506,11 +598,11 @@ agent_args_override:
 
 Do not put a model flag under `opencode` here: these flags go to `opencode serve`, which exits with usage on an unknown option. Use `agent_config.opencode.model` instead.
 
-For Codex, `service_tier` and reasoning effort tune different things: `service_tier` selects the speed or priority lane, while reasoning depth is what [`agent_config`](#agent_config)'s `effort` sets (as `-c model_reasoning_effort`). no-mistakes reloads global config while setting up each run, so edits made before `no-mistakes axi run` apply to that run. An opt-in [per-run Pi profile](#per-run-pi-profiles) still keeps its pinned model and effort for that run's lifetime. For repeatable profiles, use separately initialized `NM_HOME` directories; each has its own `config.yaml` and no-mistakes state.
+For Codex, `service_tier` and reasoning effort tune different things: `service_tier` selects the speed or priority lane, while reasoning depth is what [`agent_config`](#agent_config)'s `effort` sets (as `-c model_reasoning_effort`). For immutable selection rules, see [per-run Pi profiles](#per-run-pi-profiles) and [reviewer profiles](#per-run-reviewer-profiles). For repeatable profiles, use separately initialized `NM_HOME` directories; each has its own `config.yaml` and no-mistakes state.
 
 ### forge_profiles
 
-Optional machine-local routing for repositories that use different GitHub or GitLab identities. Keys are the raw host tokens recorded in the repository remote, including SSH aliases such as `github-personal`. Each entry must set exactly one provider config directory:
+Optional machine-local routing for repositories that use different GitHub or GitLab identities. Keys are the raw host tokens recorded in the repository remote, including SSH aliases such as `github-personal`. A `gh_user` profile key may also name one repository owner as `host/owner`. Each entry must set exactly one provider config directory, or select a signed-in GitHub login with `gh_user`:
 
 ```yaml
 forge_profiles:
@@ -521,24 +613,44 @@ forge_profiles:
   gitlab-work:
     glab_config_dir: ~/.config/glab-work
     expected_login: team-bot
+  github.com/remicaesar:
+    gh_user: remicaesar
 ```
 
 Paths must be absolute or begin with `~/`; environment variables and other shell expansion are not supported. Host keys are case-insensitive.
 
-When a repository matches a profile, no-mistakes validates it before starting the pipeline and applies an immutable environment to every subprocess in that run: built-in provider commands, custom shell commands, agents, managed agent servers, and the run's Git commands together with any hooks or credential helpers they spawn. A GitHub profile sets `GH_CONFIG_DIR` and removes higher-precedence GitHub token, host, and repository variables; a GitLab profile does the equivalent for `GLAB_CONFIG_DIR` and GitLab variables. The daemon process environment is never changed.
+`forge_profiles` is read from the global config only. Repository config, including the pushed branch's `.no-mistakes.yaml`, can never add, select, or change a profile, because a profile decides whose credentials the run executes with.
 
-Each selected GitHub config must contain the target host and exactly one account for it, with that account active. A selected GitLab config must contain the target host. An optional `expected_login` pins the account name the profile must be signed in as; resolution fails closed when the config's active login differs or is missing, so a swapped or re-authenticated config directory can never route a run through the wrong account. It carries an account name only, never credentials. `no-mistakes doctor` validates every configured profile and its online authentication.
+When a repository matches a profile, no-mistakes validates it before starting the pipeline and applies an immutable environment to every subprocess in that run: built-in provider commands, custom shell commands, agents, managed agent servers, and the run's Git commands together with any hooks or credential helpers they spawn. A GitHub profile sets `GH_CONFIG_DIR` (or, for a `gh_user` profile, the selected login's token, described below) and removes higher-precedence GitHub token, host, and repository variables; a GitLab profile does the equivalent for `GLAB_CONFIG_DIR` and GitLab variables. The daemon process environment is never changed.
 
-Profile activation is provider-specific and fail-closed: after at least one GitHub profile is configured, a GitHub repository must match a GitHub profile; GitLab remains ambient unless a GitLab profile is also configured, and vice versa. With no `forge_profiles`, provider detection and ambient CLI authentication behave exactly as before.
+Each selected GitHub config directory (`gh_config_dir`) must contain the target host and exactly one account for it, with that account active. A selected GitLab config must contain the target host. An optional `expected_login` pins the account name the profile must be signed in as; resolution fails closed when the config's active login differs or is missing, so a swapped or re-authenticated config directory can never route a run through the wrong account. It carries an account name only, never credentials. `no-mistakes doctor` validates every configured profile and its online authentication.
 
-For a GitHub fork, no-mistakes considers both the parent and fork host tokens. A match on either side is sufficient. If both match, they must select the same account: the same effective provider config directory *and* the same `expected_login` pin. Otherwise startup fails as ambiguous, so two host tokens sharing a config directory while pinning different logins can never silently resolve to one of them. Fork PR topology itself is unchanged.
+#### Choosing one of several gh accounts with `gh_user`
+
+When one gh configuration holds several accounts for the same host, `gh_user` selects one of them by login without a separate config directory or SSH alias. Key the profile by `host/owner` so it applies only to repositories that owner holds:
+
+```yaml
+forge_profiles:
+  github.com/remicaesar:
+    gh_user: remicaesar
+```
+
+At run setup, no-mistakes runs `gh auth token --hostname <host> --user <gh_user>` once, against the ambient gh configuration, and gives that token to every subprocess in the run as `GH_TOKEN` (`GH_ENTERPRISE_TOKEN` on a GitHub Enterprise Server host). The other GitHub token, host, and repository variables are removed as for any GitHub profile. gh prefers that variable over its active account, and `gh auth git-credential` returns it, so HTTPS pushes through the gh credential helper authenticate as the same login. The token is held in memory for the run only: it never appears in arguments, logs, files, or the run record, and a recovered run reads it again. A profile never stores a token itself.
+
+If gh has no token for that login on the host (the login is unknown or signed out), the run fails at setup with the gh error; it never falls back to the active account. `gh_user` cannot be combined with `gh_config_dir`, `glab_config_dir`, or `expected_login` (the login it names is already the pin).
+
+An owner-scoped key is looked up before its plain host key, and a repository whose owner has no scoped key falls back to the plain host key, so existing host-keyed profiles keep working unchanged. An owner-scoped key never activates routing for other owners: with only `github.com/remicaesar` configured, repositories other owners hold on `github.com` keep ambient authentication. Owner-scoped keys are supported for `gh_user` profiles only.
+
+Profile activation is provider-specific and fail-closed: after at least one plain host-keyed GitHub profile is configured, a GitHub repository must match a GitHub profile; GitLab remains ambient unless a GitLab profile is also configured, and vice versa. With no `forge_profiles`, provider detection and ambient CLI authentication behave exactly as before.
+
+For a GitHub fork, no-mistakes considers both the parent and fork remotes. A match on either side is sufficient. If one side matches an owner-scoped key and the other only a plain host key, the owner-scoped profile wins, so a contributor's fork owner selects the account that pushes to the fork and opens the PR. Otherwise, if both match, they must select the same account: the same effective provider config directory, the same `expected_login` pin, *and* the same `gh_user`. Otherwise startup fails as ambiguous, so two host tokens sharing a config directory while pinning different logins can never silently resolve to one of them. Fork PR topology itself is unchanged.
 
 Deliberate scope boundaries, so profiles never duplicate what other layers own:
 
-- **Commit identity stays with Git.** Author and committer for pipeline fix commits come from the effective Git configuration (for example remote-keyed `includeIf` sections), which resolves naturally inside run worktrees. Profiles carry no name/email fields.
-- **Two accounts on the same host are distinguished by remote host tokens.** Give each account its own SSH alias (`github-personal`, `github-work`) and key a profile per alias; a profile cannot disambiguate two accounts behind one identical remote URL.
+- **Commit identity is independent of forge profiles.** Profiles carry no name/email fields. See the [pipeline commit identity policy](/no-mistakes/reference/pipeline-steps/) for submission binding and author preservation.
+- **Two accounts on the same host are distinguished by remote host token or repository owner.** Either give each account its own SSH alias (`github-personal`, `github-work`) and key a profile per alias, or key GitHub profiles by `host/owner` with `gh_user`; a profile cannot disambiguate two accounts behind one identical remote URL.
 - **Executable selection stays with the machine.** Which `gh`, `glab`, or `git` runs is owned by `PATH` and the existing command resolution, not by profile configuration.
-- **Credential-helper context stays with Git configuration.** Profiles point at provider CLI config directories and never model or store credential material; credentials remain in the CLI's own store.
+- **Credential-helper context stays with Git configuration.** Profiles point at provider CLI config directories or name a login, and never model or store credential material; credentials remain in the CLI's own store, and a `gh_user` token is only read from it for the run.
 
 ### provider_plugins
 
@@ -589,7 +701,7 @@ A genuinely idle/abandoned PR still parks at an approval gate after the timeout 
 While that CI gate is parked, the daemon continues bounded read-only PR-state checks.
 If the PR is merged or closed externally, the stale gate completes automatically; an open, unknown, or temporarily unreachable PR remains parked for a user decision.
 
-Set it to `unlimited` (`none`, `off`, and `never` are accepted aliases), `0`, or any non-positive duration to disable this timeout. A run still ends when the PR is merged or closed, or at readiness under `ci.release_after_checks_pass`. You can cancel it with `no-mistakes axi abort --run <id>`.
+Set it to `unlimited` (`none`, `off`, and `never` are accepted aliases), `0`, or any non-positive duration to disable this timeout. A run still ends when the PR is merged, closed, or declined, when green monitoring is explicitly handed off, or at readiness under `ci.release_after_checks_pass`. You can end it explicitly with `no-mistakes axi handoff` or cancel it with `no-mistakes axi abort --run <id>`.
 
 Legacy alias: `babysit_timeout`.
 
@@ -629,6 +741,20 @@ Before retrying, the executor proves that the run and worktree head SHA, recorde
 A hang cut by the default invocation budget can qualify. A non-default agent timeout, or any still-working cap, disables timeout-based crash retries; the shipped timeout values count as unconfigured even when the generated config writes them explicitly. Process exits can still qualify. Test budget cuts that already park for an operator decision remain parked, not automatically retried.
 
 Fix rounds, review-answer/coverage continuations, conflict resolution, custom gates, Intent and Push/PR/CI delivery are not replayed or retried. This budget is separate from `auto_fix`, is not replenished by approval rounds, and is disabled for the remainder of a run resumed after daemon recovery; a later agent crash fails that step normally. It does not continue a terminal run: [`axi retry`](/reference/cli/#axi-retry) is the separate manual continuation, using the shared `agent_invocation` cause and its own checkpoint proofs. Timeout cuts do not acquire that cause, and parser rejections remain terminal. It is global-only: repository config and environment variables cannot enable it.
+
+### max_concurrent_runs
+
+Opt-in cap on how many pipeline runs execute at once on this machine. When the cap is reached, newly submitted runs wait in the queue in submission order with their run row pending, and start as running runs finish, fail, or are cancelled, instead of all starting at once and competing for host memory and CPU.
+
+|         |                        |
+| ------- | ---------------------- |
+| Type    | integer                |
+| Range   | `0` or greater         |
+| Default | `0` (unlimited)        |
+
+`0` or unset means unlimited. An admitted run holds its slot until its executor finishes, fails, or is cancelled, including while parked at an approval gate. Recovered parked runs use the same cap and wait for a slot before resuming. Cancelling a queued run removes it from the queue without starting or resuming it.
+
+Fresh queued runs do not survive a daemon restart and must be resubmitted. Recovered parked runs waiting for a slot remain recoverable across a clean shutdown. If the global configuration cannot be read, the daemon keeps the last successfully loaded cap. It is global-only: repository config cannot set it.
 
 ### agent_timeout
 
@@ -812,7 +938,7 @@ Accepts any positive Go `time.ParseDuration` string. Global-only: there is no ma
 
 ### gate_reconcile_timeout
 
-Maximum wall time one parked approval-gate reconcile attempt may spend before the attempt stops, the gate stays parked, and the next interval wait begins. Covers host probes such as `gh auth status` that can hang without returning.
+Maximum wall time one parked approval-gate reconcile attempt may spend before the attempt stops, the gate stays parked, and the next interval wait begins. Covers host probes such as `gh auth status` that can hang without returning. The same bound applies to the live verification an approve response runs at a parked CI gate; a verification that times out counts as unverifiable, so it is refused while a [`ci.required_reviews`](/no-mistakes/reference/repo-config/#cirequired_reviews) requirement applies and otherwise recorded as an explicit override.
 
 |         |                        |
 | ------- | ---------------------- |
@@ -976,6 +1102,12 @@ Set `0` here to never spend someone else's CI minutes; this is the only place to
 
 The per-repo [`ci.rerun_transient`](/no-mistakes/reference/repo-config/#cirerun_transient) overrides this value and owns the classification, the trust boundary, and every case that skips the rerun.
 
+### ci.required_reviews
+
+The operator-level fallback for [`ci.required_reviews`](/no-mistakes/reference/repo-config/#cirequired_reviews).
+That reference owns supported reviewer profiles, completion evidence, and the trust boundary.
+Defaults to `[]`; the trusted repository list overrides it, including an explicit empty list. `ci.required_review_app_id` may pin the GHES CodeRabbit App ID; `ci.required_review_bot_id` may pin the GitLab CodeRabbit account ID. These are identifiers, not credentials, and must match the configured forge.
+
 ### ci.revalidate_repairs
 
 The operator-level fallback for [`ci.revalidate_repairs`](/no-mistakes/reference/repo-config/#cirevalidate_repairs), whose per-repository reference owns the repair-delivery semantics, safety rationale, and trust boundary.
@@ -1125,12 +1257,14 @@ The template supports literal text and three Go-style placeholders:
 
 The value must be a valid UTF-8 template that renders to a non-empty, single-line commit subject.
 The template source is limited to 1,024 bytes and 16 placeholders.
-The fix-agent summary and final rendered subject are each limited to 4,096 bytes.
-Before rendering, no-mistakes predicts the subject size from the validated literal text and placeholders, then rejects oversized output without allocating the expanded message.
+The fix-agent summary is limited to 4,096 bytes, and the final rendered subject is held to 4,096 bytes. When the summary would push the subject past that limit, no-mistakes truncates the summary without splitting a UTF-8 character. The summary keeps the largest whole-character prefix that fits alongside an ellipsis (`…`), removing any trailing space before the ellipsis. Repeated `{{.Summary}}` placeholders share the remaining byte budget equally and render the same truncated summary. If exactly three bytes remain per summary placeholder, only the ellipsis is emitted; if fewer than three bytes remain, the summary is dropped entirely without a marker. Literal template text, `{{.Step}}`, and `{{.Branch}}` are never truncated, so a template that overflows without any summary still fails.
+Before rendering, no-mistakes predicts the subject size from the validated literal text and placeholders, then rejects a subject whose non-summary text alone overflows, without allocating the expanded message.
 Template functions, control actions, named templates, unknown placeholders, malformed syntax, control characters, unsafe Unicode format characters, and Unicode line or paragraph separators cause configuration loading to fail.
 The blocked format set includes every Unicode `Bidi_Control` code point plus `U+00AD`, `U+180E`, `U+200B`, `U+2060` through `U+2064`, the deprecated bidi controls `U+206A` through `U+206F`, `U+FEFF`, `U+FFF9` through `U+FFFB`, and Unicode tag characters in `U+E0000` through `U+E007F`.
 Legitimate `U+200C` zero-width non-joiner and `U+200D` zero-width joiner text shaping remains allowed.
 The final rendered subject is validated again, so unsafe characters in an agent-provided summary are also rejected.
+Each fix prompt, including CI repair, tells the agent how many characters the summary may use so the subject stays within 72: 72 minus the rendered text around the summary, divided by the number of times the template uses `{{.Summary}}`, with a floor of 20. The 72-character target is guidance only; summaries exceeding that target remain unchanged when the rendered subject fits the 4,096-byte limit.
+CI repair prompts direct the agent to keep detailed diagnosis and verification evidence in its explanatory output, recorded in the run log, rather than in the summary.
 The setting does not change commit subjects created by the Rebase step or the evidence-branch commit; see [`test.evidence`](#testevidence) for the latter.
 A per-repo [`commit.fix_message`](/no-mistakes/reference/repo-config/#commitfix_message) value overrides this global setting.
 
@@ -1209,10 +1343,30 @@ An invalid entry fails configuration loading, and a render failure at commit tim
 Trailers are added to Review, Test, Document, and Lint fix commits, operator-authorized repository gate repairs, and CI repair commits. Commits that no single invocation produced get none rather than a guessed agent: the Push step's catch-all commit, a CI repair retried after a protected-path refusal, and rebase or merge commits that an agent writes itself.
 A per-repo [`commit.trailers`](/no-mistakes/reference/repo-config/#committrailers) list or a matching [`repository_overrides`](#repository_overrides) entry replaces this list rather than extending it; an empty list clears it.
 
+### pr.appendix
+
+Machine-wide default for the generated PR evidence appendix:
+
+```yaml
+pr:
+  appendix: collapsed # full | collapsed | minimal
+```
+
+Precedence: a non-empty trusted repository `pr.appendix`, then a matching
+[`repository_overrides`](#machine-local-pr-publication-defaults) value, then this
+global value, then built-in `full`. An unset or empty value inherits the next
+layer. The pushed branch cannot choose the appendix mode, even with
+`allow_repo_commands: true`.
+
+All modes retain the pipeline attestation. See the repository
+[`pr.appendix`](/no-mistakes/reference/repo-config/#prappendix) reference for
+rendering behavior and provider caveats. Invalid modes fail config loading.
+`pr.template`, `pr.publish_intent`, and `pr.intent` are not machine-wide settings.
+
 ### repository_overrides
 
 Machine-local settings scoped to one repository by remote host and full repository path.
-This lets one machine add checks, lower command scheduling priority, add review and documentation guidance, or apply ticket conventions without adding settings to that repository.
+This lets one machine add checks, lower command scheduling priority, add review, documentation, and live-validation guidance, choose review-loop agents, or apply ticket conventions without adding settings to that repository.
 Remote hosts are matched case-insensitively.
 HTTP, HTTPS, SSH, and Git-protocol URLs, plus scp-style remotes, are accepted; the transport scheme is not part of the match.
 A URL's scheme-default port (80, 443, 22, or 9418 for HTTP, HTTPS, SSH, or Git) matches an omitted port; non-default ports remain distinct.
@@ -1248,16 +1402,18 @@ repository_overrides:
     pr:
       template: .github/pull_request_template.md
       appendix: collapsed
+      update_text: keep # keep | regenerate (default)
 ```
 
 `pr.template` selects a repository-relative file, never local template contents. It uses the same [path and file validation](/no-mistakes/reference/repo-config/#prtemplate) as the repository setting, and its bytes are read only from the pinned trusted default-branch tree, never from the pushed branch or worktree.
 `pr.appendix` accepts `full`, `collapsed`, or `minimal` and can be set with or without `pr.template`; it uses the same [appendix and attestation behavior](/no-mistakes/reference/repo-config/#prappendix) as the repository setting. When template mode is active, author-edited narrative is preserved on later updates.
-For each field, a non-empty trusted repository value wins over the matching machine-local value. Leaving either unset retains existing behavior; an unset appendix defaults to `full`.
-These fields are available only under `repository_overrides`, not as machine-wide PR settings. `pr.publish_intent` remains trusted-repository-only.
+`pr.update_text` accepts `keep` or `regenerate`. The default is `regenerate`, also used when the key is absent. `regenerate` replaces the title and body on update, as today, but only while the live body carries no owned appendix markers. Once `keep` has created or updated a PR, that PR keeps its title and narrative even after the key changes back to `regenerate` or is removed, the same rule that stops removing `pr.template` from switching an owned body back. `keep` leaves the live title unchanged and keeps the narrative above the appendix byte for byte, the same preservation [`pr.template`](/no-mistakes/reference/repo-config/#prtemplate) already uses, including when that repository has no template file. The step still creates the pull request when none exists: the ordinary drafter supplies the title and narrative, and the evidence is stored as that owned appendix. Every later update refreshes the appendix, or the `minimal` risk line, and the attestation, so they match the current head. If that narrative and the evidence cannot fit the publication budget, the step fails instead of truncating them. A configured `pr.title_format` still redrafts the bare title. A description freshly supplied with [`axi run --pr-body-file`](/no-mistakes/reference/cli/#supplied-pr-title-and-description) is published as that same owned narrative whatever this key says, including when updating an existing PR. Inherited text on a plain rerun does not override this setting. Without a freshly supplied replacement description, an existing body that already carries an unowned attestation is refused until that generated evidence is separated from the narrative, the same adoption rule as template mode. To prepare an already open PR that an earlier `regenerate` run published, move its generated evidence out of the body by hand once before enabling `keep`. Any other value fails config loading. A repository `.no-mistakes.yaml` cannot set this key, and it is not a machine-wide `pr` setting.
+For `pr.template`, a non-empty trusted repository value wins over the matching machine-local value. For appendix inheritance, see [`pr.appendix` precedence](#prappendix).
+`pr.template` is available only under `repository_overrides`, not as a machine-wide PR setting. `pr.publish_intent` and `pr.intent` remain trusted-repository-only.
 
-#### Machine-local review and documentation guidance
+#### Machine-local review, documentation, and test guidance
 
-A matching entry can add review rules and documentation policy for that one repository, without committing anything to it:
+A matching entry can add review rules, documentation policy, and a live-validation runbook for that one repository, without committing anything to it:
 
 ```yaml
 repository_overrides:
@@ -1270,14 +1426,40 @@ repository_overrides:
     document:
       instructions: |
         Configuration keys are owned by docs/reference/config.md.
+    test:
+      instructions: |
+        Never install, launch, or test on a physical device; drive the emulator only.
 ```
 
 `review.path_instructions` behaves like the [global list](#reviewpath_instructions): its rules render in their own labeled section after the global rules and before the repository's trusted rules, and they count toward the same combined limits.
 `document.instructions` is added to the document step's prompt in a labeled section before the repository's trusted [`document.instructions`](/no-mistakes/reference/repo-config/#documentinstructions), and like that field it augments the built-in placement policy and cannot weaken it.
-Both are additive only: the repository's trusted values still apply in full.
-Under `review` only `path_instructions` is accepted, and under `document` only `instructions`; settings that could weaken a gate, such as `no_ci`, `allow_repo_commands`, or `pr.base_branch`, are not accepted here.
+`test.instructions` is added to the Test step's repair and evidence prompts in a labeled section before the repository's trusted [`test.instructions`](/no-mistakes/reference/repo-config/#testinstructions) runbook.
+All three are additive only: the repository's trusted values still apply in full, and a pushed branch can supply none of them.
+Under `review` only `path_instructions` is accepted, under `document` only `instructions`, and under `test` only `instructions`; settings that could weaken a gate, such as `no_ci`, `allow_repo_commands`, or `pr.base_branch`, are not accepted here.
+Changes apply to the next run, and to a run recovered after a daemon restart, which re-reads this file.
 
-Eval replay cases store no remote URL, so a replay does not apply a matching entry's review or documentation guidance.
+Eval replay cases store no remote URL, so a replay does not apply a matching entry's review, documentation, or test guidance.
+
+#### Machine-local review agents
+
+A matching entry can choose the review loop's harnesses for that one repository, with the same roles and fields as the global [`review_agents`](#review_agents) block:
+
+```yaml
+review_agents:
+  reviewer: {agent: claude}
+  fixer: {agent: codex}
+repository_overrides:
+  https://github.com/acme/widget.git:
+    review_agents:
+      reviewer:
+        agent: opencode
+        model: openrouter/z-ai/glm-4.6
+```
+
+Each role the entry names replaces the global entry for that role whole, including its `fallback` and `after_round`; roles it omits keep the global value. Above, `acme/widget` reviews on OpenCode and still fixes on Codex, and every other repository keeps both global roles. An entry without `review_agents` changes nothing.
+Entries are validated at load with the same rules and messages as the global block, prefixed with the override's normalized remote.
+The entry is matched against the registered repository's remote, so a pushed branch can never select it, and the repository's own `.no-mistakes.yaml` still cannot set `review_agents`.
+For run-pin precedence and eligibility, see [per-run Pi profiles](#per-run-pi-profiles) and [per-run reviewer profiles](#per-run-reviewer-profiles).
 
 #### Machine-local commands
 
@@ -1347,10 +1529,31 @@ When enabled and no intent was supplied directly for the run, no-mistakes can re
 | `intent.slack_days`       | `int`      | `3`     | Extra days to look back before the change window           |
 | `intent.disabled_readers` | `string[]` | Empty   | Transcript readers to disable                              |
 | `intent.publish_intent`   | `bool`     | `true`  | Publish the generated Intent section on PR bodies by default |
+| `intent.check`            | `object`   | `off`    | Add deterministic term and pattern checks for run intent       |
 
 Valid `disabled_readers` values are `claude`, `codex`, `opencode`, `rovodev`, `pi`, and `copilot`.
 
 `intent.publish_intent: false` is a global, operator-side default that keeps the generated `## Intent` section out of the PR body for runs started without an explicit override. It is the caller-side counterpart of the repository's trusted [`pr.publish_intent`](/no-mistakes/reference/repo-config/#prpublish_intent): both are tighten-only, the repository's trusted policy remains the ceiling a caller can never exceed, and review, test, document, lint, and CI auto-fix prompts keep the full intent. Under the caller-side omission the PR-drafting turns receive no intent text at all and draft from the diff and commit messages only; the intent is withheld from them, never scanned out of their output. A run records the folded decision (the `axi run --no-publish-intent` flag OR this global default) at start; reruns inherit it, and a mid-run config change never re-publishes. This field is global-only: a pushed branch's `.no-mistakes.yaml` cannot express it.
+
+#### intent.check
+
+Configure deterministic rules that warn about or reject run intent before pipeline agents act on it. The same `intent.check` block is available in global config and the repository's trusted default-branch config. Global and trusted repository rules combine additively; the stronger mode wins. A pushed branch cannot add, remove, or weaken rules, even when `allow_repo_commands: true`.
+
+```yaml
+intent:
+  check:
+    mode: reject # off (default) | warn | reject
+    terms:
+      - "internal project label"
+    patterns:
+      - '(?i)run-[a-z0-9-]+'
+```
+
+`terms` match case-insensitive literal substrings. `patterns` use Go RE2 regular expressions and are case-sensitive unless the expression enables `(?i)`. Explicit, inherited, proof, push, rerun, retry, and other supplied intent is checked before it can supersede an active run or start a pipeline agent. Transcript-inferred intent is checked after extraction and before no-mistakes stores or forwards the summary. `--skip intent` does not bypass the policy.
+
+`off` performs no checks. `warn` writes a private local warning and continues. `reject` stops the run. Warning, error, and log messages list matching rule indexes only; they never echo matched text. Warnings are not findings and are never published.
+
+Each config layer accepts at most 32 terms and patterns combined, at most 256 bytes per rule, and at most 8 KiB of rule text. Invalid modes, empty or oversized rules, over-limit policies, and invalid RE2 expressions fail config loading. The default is `off`; leaving `intent.check` unset preserves existing behavior.
 
 The match score is the share of matching files mentioned in a transcript session; deleted files are ignored when the diff also contains non-deleted changes.
 All-deletion diffs still match against the deleted changed files.
@@ -1360,10 +1563,29 @@ Partial matches older than 24 hours are rejected unless their raw score is at le
 If exactly one accepted candidate has a raw score of at least `0.85`, that decisive candidate wins before recency ranking.
 Otherwise, accepted candidates are ranked by confidence, which combines the raw score with a small recency boost, with ties going to the most recent matching session, and ambiguous accepted candidates may be disambiguated by the configured pipeline agent.
 
+### evidence_dir
+
+Parent directory for new run evidence. Global-only. A repository cannot set it.
+
+| | |
+| ---- | -------- |
+| Type | `string` |
+| Default | `<NM_HOME>/evidence` |
+
+Set `evidence_dir` to an absolute path, `~`, or a path starting with `~/` (or `~\` on Windows). New runs write `<evidence_dir>/<run-id>`. When the key is absent or empty, `test.evidence.local_root` still selects the parent, with `<NM_HOME>/evidence` as its default. A nonempty `evidence_dir` takes precedence over `local_root`.
+
+If the directory is missing, not writable, not absolute after `~` expansion, or overlaps a default, configured, or recorded worktree placement, no-mistakes logs a warning and uses `<NM_HOME>/evidence`. It does not use `test.evidence.local_root` as that fallback. It does not create a missing directory, and it does not move a directory that already exists.
+
+If the default evidence directory also overlaps a worktree placement, run creation fails rather than writing evidence into a checkout.
+
+A run records its evidence directory at creation. A later change to `evidence_dir` does not retarget that run. A run recorded before this setting existed keeps resolving through `test.evidence.local_root`.
+
+For GitLab image uploads from that run directory, see [Pull request](/no-mistakes/reference/pipeline-steps/#pull-request).
+
 ### test.evidence
 
 Test-step evidence storage settings.
-By default, evidence artifacts are written to `<NM_HOME>/evidence/<run-id>`. On GitHub.com/GHEC, supported image and video artifacts are also uploaded when the PR is rendered; see `attach_media` below.
+By default, evidence artifacts are written to `<NM_HOME>/evidence/<run-id>`. [`evidence_dir`](#evidence_dir) moves that parent for new runs. On GitHub.com/GHEC, supported image and video artifacts are also uploaded when the PR is rendered; see `attach_media` below.
 
 |      |          |
 | ---- | -------- |
@@ -1372,20 +1594,27 @@ By default, evidence artifacts are written to `<NM_HOME>/evidence/<run-id>`. On 
 | Field                         | Type     | Default                  | Description                                                                |
 | ----------------------------- | -------- | ------------------------ | -------------------------------------------------------------------------- |
 | `test.evidence.store_in_repo` | `bool`   | `false`                  | Publish test evidence artifacts to the repository's orphan evidence branch |
-| `test.evidence.attach_media`  | `bool`   | `true`                   | Upload image and video evidence to GitHub user-attachments when the PR is rendered |
+| `test.evidence.attach_media`  | `bool`   | GitHub: `true`; GitLab: `false` | Upload evidence when the PR is rendered: images/videos to GitHub user-attachments, images to GitLab project uploads |
+| `test.evidence.compact`       | `bool`   | `true`                   | Keep the PR Testing section compact; set `false` for inline previews and expanded details |
 | `test.evidence.dir`           | `string` | `.no-mistakes/evidence`  | Directory prefix inside the evidence branch                                |
 | `test.evidence.branch`        | `string` | `no-mistakes/evidence`   | Name of the orphan evidence branch                                         |
 | `test.evidence.commit_message` | `string` | `no-mistakes: evidence for {{.Branch}} (run {{.RunID}})` | Subject template for evidence-branch commits |
-| `test.evidence.local_root`    | `string` | `<NM_HOME>/evidence`     | Absolute directory where run evidence is written on local disk             |
+| `test.evidence.local_root`    | `string` | `<NM_HOME>/evidence`     | Absolute parent for run evidence when `evidence_dir` is unset             |
+| `test.evidence.link_base_url` | `string` | unset                    | Opt-in `http(s)` base for links to locally served evidence; see [Evidence links](#evidence-links) (global-only) |
 | `test.evidence.retention`     | `string` | `336h` (14 days)         | How long a run's evidence survives; `unlimited`/`none`/`off`/`never` or a non-positive duration disables the bound |
 | `test.evidence.max_runs`      | `int`    | `200`                    | How many run directories survive regardless of age; `0` disables the bound |
 
+`compact: true` preserves the compact PR Testing section. Set `compact: false` to opt into inline screenshot/GIF previews, video embeds, visible log/text blocks, individual test-command bullets, and a summary bullet. Both modes retain inspectable artifact links alongside previews when published links are available. This presentation setting does not enable uploads or evidence publication; for commit-pinned inline images, also enable `store_in_repo`.
+
+Non-compact sections are taller and can approach GitHub's PR body size limit sooner, especially with many screenshots. Repository weight is unchanged: with `store_in_repo` enabled, the same artifacts are committed to the evidence branch in either mode. Pipeline steps and their order are unchanged.
+
 The test step always collects evidence outside the worktree, so artifacts never enter the branch under validation.
-On GitHub.com and GitHub Enterprise Cloud, image and video artifacts that pass GitHub's attach rules (png, jpg, jpeg, gif, webp, svg, mp4, mov, webm; images at most 10 MiB and videos at most 100 MiB) are uploaded to GitHub user-attachments when the PR body is rendered, unless `attach_media` is false and `store_in_repo` is also false.
-Uploads need the raw GitHub token, which the PR step reads once per PR render with `gh auth token`; when that read fails, the step logs one line and skips every remaining upload in that render instead of asking again per file. If your `gh` sits behind a credential vault or disclosure gate that prompts before it releases the token, set `attach_media: false` (with `store_in_repo` also false) so the PR step never asks for it.
-The testing section embeds the returned image markdown or bare video URL so remote reviewers can open the media. Upload is fail-closed: any error, unsupported type, oversize file, GitHub Enterprise Server, non-GitHub forge, or GitHub App/Actions token keeps today's rendering (a commit-pinned evidence-branch link if `store_in_repo` published, otherwise a local path) rather than a dead attachment URL. Text artifacts stay inlined as they are today.
+On GitHub.com and GitHub Enterprise Cloud, image and video artifacts that pass GitHub's attach rules (png, jpg, jpeg, gif, webp, svg, mp4, mov, webm; images at most 10 MiB and videos at most 100 MiB) are uploaded to GitHub user-attachments when the PR body is rendered, unless `attach_media` is false. Setting `attach_media: false` disables uploads even when `store_in_repo: true`; evidence-branch publication and its commit-pinned links remain enabled.
+The same setting gates GitLab evidence uploads, which require explicit `attach_media: true` in global or repository config. For the GitLab Evidence section, including its behavior without uploads, see [Pull request](/no-mistakes/reference/pipeline-steps/#pull-request).
+GitHub uploads need the raw GitHub token, which the PR step reads once per PR render with `gh auth token`; when that read fails, the step logs one line and skips every remaining upload in that render instead of asking again per file. If your `gh` sits behind a credential vault or disclosure gate that prompts before it releases the token, set `attach_media: false` so the PR step never asks for it.
+For GitHub attachments, the testing section embeds the returned image markdown or bare video URL so remote reviewers can open the media. Upload is fail-closed: any error, unsupported type, oversize file, GitHub Enterprise Server, non-GitHub forge, or GitHub App/Actions token falls back to the configured evidence presentation rather than a dead attachment URL. Published evidence retains commit-pinned links, with previews when `compact: false`; unpublished local artifacts follow [Evidence links](#evidence-links). Text artifacts remain inline or collapsible according to `compact`.
 When `store_in_repo` is true for a GitHub repository, the PR step copies that directory onto `branch` under `<dir>/<branch-slug>` in the code branch's push-target repository (the fork when fork routing is configured), pushes it, and links the artifacts from the pull request body.
-Published text files get the same home-directory redaction as the PR title and body, so a path under the operator's home is committed with that part rewritten to `~`. Binary and visual artifacts are published as written, and the local evidence files are never changed.
+Published text files get the same home-directory redaction as the PR title and body, so a path under the operator's home is committed with that part rewritten to `~`. Before that, the run's worktree root, and any path into another run worktree under `<NM_HOME>/worktrees/<repo-id>/<run-id>`, is rewritten to `{run-worktree}` (a bare `<NM_HOME>/worktrees` or `<NM_HOME>/worktrees/<repo-id>` to `{worktrees}`), because the repo id is a hash of the local checkout path and `NM_HOME` may sit outside the home directory. Binary and visual artifacts are published as written, and the local evidence files are never changed.
 When both `attach_media` and `store_in_repo` apply, the testing section carries the user-attachments embed in addition to the commit-pinned git link.
 The branch is an orphan: it shares no history with your code branches, so evidence never reaches the default branch. Links use the evidence commit rather than the branch, so they keep resolving after later runs.
 Branch slashes become nested directories, unsafe branch characters are replaced, and an empty branch slug falls back to the run ID.
@@ -1393,25 +1622,38 @@ Branch slashes become nested directories, unsafe branch characters are replaced,
 `commit_message` supports literal text and two placeholders: `{{.Branch}}` (the code branch name) and `{{.RunID}}` (the run ID). It follows the same template restrictions, size limits, and unsafe-character rules as [`commit.fix_message`](#commitfix_message); an invalid template fails configuration loading, and a subject that fails validation at publish time leaves the evidence unpublished.
 The publisher never force-pushes. It appends to the fetched evidence-branch tip with a fast-forward push, retries one lost race, and refuses to use the run branch, default branch, or an existing branch whose tip lacks the `.no-mistakes-evidence` marker.
 Publication is also refused when the remote cannot be read or pushed, an artifact exceeds 64 MiB, a run exceeds 500 files or 256 MiB, or another writer wins the retry. The PR body then keeps its local rendering instead of adding links that would not resolve.
-Evidence-branch publication currently supports GitHub links only. On other providers, no evidence branch is pushed and the PR body keeps its local rendering.
+Evidence-branch publication currently supports GitHub links only. On other providers, no evidence branch is pushed. GitLab image uploads are independent of these publication settings; see [Pull request](/no-mistakes/reference/pipeline-steps/#pull-request).
 Enabling this pushes a branch to your remote, so pick a `branch` name your CI workflows do not build.
 
 #### Local storage and cleanup
 
-Evidence lives under the app root rather than the system temp directory. On Linux the daemon runs from a service unit that does not export `TMPDIR`, so the old temp-directory default resolved to the shared `/tmp`, which current Ubuntu mounts as a RAM-backed `tmpfs`. The app root is disk backed on macOS, Linux, and Windows alike.
+The default evidence location is under the app root rather than the system temp directory; [`evidence_dir`](#evidence_dir) and `local_root` can select a different parent. On Linux the daemon runs from a service unit that does not export `TMPDIR`, so the old temp-directory default resolved to the shared `/tmp`, which current Ubuntu mounts as a RAM-backed `tmpfs`. The app root is disk backed on macOS, Linux, and Windows alike.
 
-no-mistakes reaps its recorded run directories itself rather than relying on an operating-system temp cleaner. Unrecognized directories under a custom `local_root` are left untouched.
+no-mistakes reaps its recorded run directories itself rather than relying on an operating-system temp cleaner. Unrecognized directories under an evidence root are left untouched.
 
 - A finished run that produced no artifacts leaves nothing behind.
 - Recorded run directories older than `retention` are removed.
-- Whatever recorded run evidence survives is trimmed to `max_runs`, oldest first.
+- Whatever recorded run evidence survives across the current, historical, and legacy roots is trimmed to one shared `max_runs` budget, oldest first.
 - A run that is still pending or running is never touched.
 
 Reaping runs after each finished run and again at daemon startup. An upgraded daemon also drains the pre-relocation directory in the system temp directory under the same rules; nothing is migrated, because absolute paths recorded in older pull request bodies name the old location.
 
 `local_root` must be an absolute path outside `<NM_HOME>/worktrees`; a relative or managed-worktree path fails daemon startup and prevents new or recovered runs from starting. Because `retention` bounds how long a PR body's local artifact links keep resolving, raise it rather than lowering it if your reviews run long.
 
-The publication fields are global defaults. Repo config can override `store_in_repo`, `attach_media`, `dir`, and `commit_message`; it can override `branch` only through the trusted default-branch copy. `local_root`, `retention`, and `max_runs` are global-only: a repository does not get to name a filesystem path this machine's daemon writes to, or set the retention budget for a directory every repository on the machine shares.
+#### Evidence links
+
+`link_base_url` is opt-in and unset by default, and unset changes nothing: PR bodies render exactly as they do today. Set it to an absolute `http` or `https` URL when you serve the evidence parent (`evidence_dir`, or `local_root` when that is unset) over HTTP yourself, for example a synced folder behind a web server with its own access control. Local evidence references then render as markdown links to `<link_base_url>/<run-id>/<file>`, mirroring the served layout `<evidence parent>/<run-id>/<file>`, so a reviewer opens a screenshot in a new tab instead of copying a local path out of the description:
+
+- In the Testing section, each local evidence file reference (an image, binary, or over-budget artifact that was neither published nor uploaded) becomes `- Evidence: [label](<link_base_url>/<run-id>/<file>)`, on every provider and in both `compact` presentations.
+- In the scenario table, every complete reference to a file that exists under the run's evidence directory becomes a link: a name relative to that directory (nested paths and names with spaces included) or an absolute path inside it; unrelated words remain plain text, and a reference the cell already carries as a Markdown link, image, autolink, or bare URL is left exactly as written. A code span holding known evidence files renders each as a link without the backticks, preserving separators and other words; a code span without a known evidence file is left as written. Embedded transcripts retain their inline contents and gain a `Source` link in compact details or an `Evidence` link in expanded presentation.
+- For GitLab's separate `## Evidence` section, see [Pull request](/no-mistakes/reference/pipeline-steps/#pull-request).
+- In Testing artifact entries, `link_base_url` applies to local-file mentions under the evidence root where no remote link exists; it never overrides an explicit artifact URL, a successful upload, or a published evidence-branch link. Scenario-table references use the configured base independently of those artifact entries.
+
+`link_base_url` links evidence files in the evidence list lines, the scenario table’s Evidence column, transcript sources, and the GitLab Evidence section; free-form prose such as the testing summary, tested details, and artifact descriptions is left as written.
+
+Surrounding whitespace and trailing slashes are trimmed; an empty value disables the setting. A value that is not an absolute `http(s)` URL, contains whitespace after trimming, carries credentials, or has a query or fragment fails configuration loading, in the global file and in a pushed repository copy alike. Hosting, access control, and how long the served copy survives are yours; the pipeline never checks that a link resolves, and `retention` still bounds the local copy. The setting is global-only like `local_root`: a repository cannot choose where a PR's evidence links point, so a valid `test.evidence.link_base_url` in `.no-mistakes.yaml` is ignored.
+
+The publication fields are global defaults. Repo config can override `store_in_repo`, `attach_media`, `compact`, `dir`, and `commit_message`; it can override `branch` only through the trusted default-branch copy. `local_root`, `retention`, `max_runs`, and `link_base_url` are global-only: a repository does not get to name a filesystem path this machine's daemon writes to, set the retention budget for a directory every repository on the machine shares, or choose where a PR's evidence links point.
 
 `test.evidence.retention` and `test.evidence.max_runs` also bound `<NM_HOME>/logs/<run-id>` (per-run step logs), reaped on the same cadence rather than through a second config surface for the same kind of per-run diagnostic artifact.
 

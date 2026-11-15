@@ -297,13 +297,19 @@ func (s *Service) Refresh(ctx context.Context) State {
 	freshRepo, repoErr := s.DB.GetRepo(s.Repo.ID)
 	if runErr != nil || repoErr != nil || freshRun == nil || freshRepo == nil || freshRun.PushActive ||
 		value(freshRun.PushGeneration) != state.Pipeline.PushGeneration || ptr(freshRun.LastPushedSHA) != state.Pipeline.PushedHead ||
-		ptr(freshRun.PushTargetFingerprint) != TargetFingerprint(freshRepo.PushURL()) || ptr(freshRun.PushTargetKind) != targetKind(freshRepo) || ptr(freshRun.PushRef) != state.Target.Ref {
+		ptr(freshRun.PushTargetFingerprint) != TargetFingerprint(runPushURL(freshRepo, freshRun)) || ptr(freshRun.PushTargetKind) != targetKind(freshRepo) || ptr(freshRun.PushRef) != state.Target.Ref {
 		if state.PRState == "merged" || state.PRState == "closed" {
 			return state
 		}
 		return blockedPlan(state, StateTargetChanged, "blocked_binding_changed", "the push binding or configured target changed before refresh; no files or refs were changed")
 	}
 	pushURL := freshRepo.PushURL()
+	if freshRun.Integration != nil {
+		pushURL = s.resolvedPushURL(ctx, freshRepo, freshRun)
+		if pushURL == "" {
+			return blockedPlan(state, StateTargetChanged, "blocked_binding_changed", "the selected push target could not be verified before refresh; no files or refs were changed")
+		}
+	}
 
 	// Each remote operation below gets its own bounded deadline derived from
 	// ctx, rather than sharing one context across both calls: a slow-but-
@@ -454,7 +460,7 @@ func (s *Service) Apply(ctx context.Context) State {
 	freshRepo, repoErr := s.DB.GetRepo(s.Repo.ID)
 	if err != nil || repoErr != nil || freshRepo == nil || freshRun == nil || freshRun.PushActive || ptr(freshRun.LastPushedSHA) != plan.Pipeline.PushedHead ||
 		value(freshRun.PushGeneration) != plan.Pipeline.PushGeneration || ptr(freshRun.PushRef) != plan.Target.Ref ||
-		ptr(freshRun.PushTargetFingerprint) != TargetFingerprint(freshRepo.PushURL()) || ptr(freshRun.PushTargetKind) != targetKind(freshRepo) {
+		ptr(freshRun.PushTargetFingerprint) != TargetFingerprint(runPushURL(freshRepo, freshRun)) || ptr(freshRun.PushTargetKind) != targetKind(freshRepo) {
 		return blockedPlan(plan, "pipeline_owned", "blocked_generation_changed", "the pipeline push binding changed before synchronization; no files or refs were changed")
 	}
 
@@ -466,16 +472,23 @@ func (s *Service) Apply(ctx context.Context) State {
 		return recheck
 	}
 
+	pushURL := s.Repo.PushURL()
+	if freshRun.Integration != nil {
+		pushURL = s.resolvedPushURL(ctx, freshRepo, freshRun)
+		if pushURL == "" {
+			return blockedPlan(plan, StateTargetChanged, "blocked_binding_changed", "the selected push target could not be verified before synchronization; no files or refs were changed")
+		}
+	}
 	checkCtx, cancel := context.WithTimeout(ctx, s.remoteTimeout())
 	defer cancel()
-	live, err := s.runLsRemote(checkCtx, s.workDir(), s.Repo.PushURL(), plan.Target.Ref)
+	live, err := s.runLsRemote(checkCtx, s.workDir(), pushURL, plan.Target.Ref)
 	if err != nil || live != plan.Pipeline.PushedHead {
 		return blockedPlan(plan, StateRemoteRewritten, "blocked_remote_changed_before_apply", "the live remote changed before synchronization; no files or refs were changed")
 	}
 	finalPrecondition, finalRun, finalOK := s.inspect(ctx)
 	finalRepo, finalRepoErr := s.DB.GetRepo(s.Repo.ID)
 	if !finalOK || finalRun == nil || finalRepoErr != nil || finalRepo == nil || finalRun.PushActive ||
-		value(finalRun.PushGeneration) != plan.Pipeline.PushGeneration || ptr(finalRun.PushTargetFingerprint) != TargetFingerprint(finalRepo.PushURL()) || ptr(finalRun.PushTargetKind) != targetKind(finalRepo) ||
+		value(finalRun.PushGeneration) != plan.Pipeline.PushGeneration || ptr(finalRun.PushTargetFingerprint) != TargetFingerprint(runPushURL(finalRepo, finalRun)) || ptr(finalRun.PushTargetKind) != targetKind(finalRepo) ||
 		finalPrecondition.Local.Branch != plan.Local.Branch || finalPrecondition.Local.Head != plan.Local.Head || !finalPrecondition.Local.Clean {
 		return blockedPlan(finalPrecondition, StateAmbiguousContext, "blocked_assumptions_changed", "the push binding, branch, HEAD, or worktree changed immediately before synchronization; no files or refs were changed")
 	}
@@ -611,6 +624,10 @@ func (s *Service) BindRecoveryArchive(ctx context.Context, archiveRef string) St
 //	P contains                                          gate reset to it (CAS)
 //	all local
 //	work
+//	diverged,  clean     anchor P; return custody at    custody at local head;
+//	local      (P is anchored, nothing moves)   the local head;
+//	carries                                     gate reset to it (CAS)
+//	all P work
 //	diverged   any       refuse (anchor named, manual   custody at local head;
 //	                     reconcile / guarded rerun)     gate reset to it (CAS)
 //	P missing  any       refuse                         custody at local head;
@@ -624,8 +641,20 @@ func (s *Service) BindRecoveryArchive(ctx context.Context, archiveRef string) St
 // already carries every local change. That proof is deliberately narrow, and
 // everything it cannot decide - including a rebase whose fix rounds also
 // rewrote the operator's lines - falls through to the plain diverged refusal.
+// Status then offers --recover --keep-local when that verified head is already
+// pinned at the run recovery ref in the gate. The branch stays put. An
+// unverified terminal head is not offered that keep-local command.
 // No-data-loss outranks convenience here: when nothing can distinguish a
 // deliberate pipeline fix from a dropped change, the operator decides.
+//
+// The "local carries all P work" row is the same proof with the roles swapped
+// (localCarriesPreservedWork): a repair committed only in the worktree can
+// already hold everything the preserved head changed. Nothing moves, so the
+// preserved commits are not what the branch ends at, but they stay anchored and
+// their net change is proven present. It applies after P is anchored in the
+// worktree, so the relationship is decided where both objects exist. Inspection
+// reaches the same verdict without importing anything
+// (crossRepositoryRelationProven) when neither repository holds both heads.
 //
 // Fail-safe rules, in the same spirit as Refresh/Apply:
 //   - An active run always refuses: only terminal runs are recoverable.
@@ -887,6 +916,12 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 		if keepLocal {
 			return s.recoverKeepLocalAtCurrentHead(ctx, run, state, []string{run.ID}, []string{run.HeadSHA})
 		}
+		if state.Local.Clean && localCarriesPreservedWork(ctx, wd, local, preserved) {
+			// The preserved head is anchored in the worktree and every net change
+			// it made is already in the local head, so returning custody at the
+			// local head discards nothing. The worktree and branch do not move.
+			return s.finishRecover(ctx, run, false)
+		}
 		if trustedEqualTreeRewrite || preservedContainsLocalWork(ctx, wd, local, preserved) {
 			if !state.Local.Clean {
 				state.Relation = RelationDiverged
@@ -1095,7 +1130,9 @@ func (s *Service) recoverKeepLocal(ctx context.Context, run *db.Run, state State
 			if err != nil {
 				return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the invoking worktree path could not be resolved; no files or refs were changed")
 			}
-			if _, err := git.Run(ctx, s.GateDir, "fetch", "--no-tags", "--no-write-fetch-head", source, "+refs/heads/"+state.Local.Branch+":"+stagingRef); err != nil {
+			// This source is the invoking worktree, so its partial clone may
+			// fetch promised objects while upload-pack stages the kept head.
+			if _, err := git.RunWithEnv(ctx, s.GateDir, []string{"GIT_NO_LAZY_FETCH=0"}, "fetch", "--no-tags", "--no-write-fetch-head", source, "+refs/heads/"+state.Local.Branch+":"+stagingRef); err != nil {
 				return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the kept local head could not be staged into the gate; no files or refs were changed")
 			}
 			staged, err := git.Run(ctx, s.GateDir, "rev-parse", stagingRef+"^{commit}")
@@ -1206,7 +1243,8 @@ func (s *Service) recoverKeepLocalFromArchive(ctx context.Context, run *db.Run, 
 			return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the invoking worktree path could not be resolved; no files or refs were changed")
 		}
 		stagingRef := "refs/no-mistakes/custody-return/" + run.ID
-		if _, err := git.Run(ctx, s.GateDir, "fetch", "--no-tags", "--no-write-fetch-head", source, "+refs/heads/"+state.Local.Branch+":"+stagingRef); err != nil {
+		// The invoking partial clone may fetch promised objects while staging.
+		if _, err := git.RunWithEnv(ctx, s.GateDir, []string{"GIT_NO_LAZY_FETCH=0"}, "fetch", "--no-tags", "--no-write-fetch-head", source, "+refs/heads/"+state.Local.Branch+":"+stagingRef); err != nil {
 			return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the kept local head could not be staged into the gate; no files or refs were changed")
 		}
 		staged, err := git.Run(ctx, s.GateDir, "rev-parse", stagingRef+"^{commit}")
@@ -1302,6 +1340,82 @@ func preservedContainsLocalWork(ctx context.Context, dir, local, preserved strin
 		return false
 	}
 	return mergeTreePreservesFinalHead(ctx, dir, base, local, preserved)
+}
+
+// localCarriesPreservedWork is the mirror of preservedContainsLocalWork: it
+// proves the local head already holds every change the preserved head made, so
+// returning custody at the local head loses no pipeline work. It is the same
+// executable three-way merge on the merge-base, with the roles swapped, and the
+// same narrow contract: every unreadable, unrelated, conflicting, or ambiguous
+// case returns false. The preserved commits stay anchored; only their content
+// is claimed to be represented.
+func localCarriesPreservedWork(ctx context.Context, dir, local, preserved string) bool {
+	if local == "" || preserved == "" || local == preserved {
+		return false
+	}
+	base, err := git.Run(ctx, dir, "merge-base", local, preserved)
+	if err != nil || base == "" {
+		return false
+	}
+	return mergeTreePreservesFinalHead(ctx, dir, base, preserved, local)
+}
+
+// crossRepositoryRelationProven answers, without writing to the worktree, the
+// gate, or any ref, whether explicit recovery of this pair can succeed: the
+// preserved head is already in the local head's history, or one of the two
+// content-containment proofs holds. Objects are read through a union of the
+// worktree's and the gate's object stores, and the merge proofs' scratch tree
+// objects land in a quarantine directory that is removed afterwards. A failure
+// to build the union is "not proven", never a guess.
+func (s *Service) crossRepositoryRelationProven(ctx context.Context, gateDir, local, preserved string) bool {
+	wd := s.workDir()
+	worktreeObjects, err := git.Run(ctx, wd, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+	if err != nil || worktreeObjects == "" {
+		return false
+	}
+	gateObjects := filepath.Join(gateDir, "objects")
+	if info, err := os.Stat(gateObjects); err != nil || !info.IsDir() {
+		return false
+	}
+	quarantine, err := os.MkdirTemp("", "no-mistakes-union-objects-")
+	if err != nil {
+		return false
+	}
+	defer os.RemoveAll(quarantine)
+	env := []string{
+		"GIT_OBJECT_DIRECTORY=" + quarantine,
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES=" + worktreeObjects + string(os.PathListSeparator) + gateObjects,
+	}
+	if _, err := git.RunWithEnv(ctx, wd, env, "cat-file", "-e", preserved+"^{commit}"); err != nil {
+		return false
+	}
+	if _, err := git.RunWithEnv(ctx, wd, env, "cat-file", "-e", local+"^{commit}"); err != nil {
+		return false
+	}
+	if _, err := git.RunWithEnv(ctx, wd, env, "merge-base", "--is-ancestor", preserved, local); err == nil {
+		return true
+	}
+	if _, err := git.RunWithEnv(ctx, wd, env, "merge-base", "--is-ancestor", local, preserved); err == nil {
+		return true
+	}
+	base, err := git.RunWithEnv(ctx, wd, env, "merge-base", local, preserved)
+	if err != nil || base == "" {
+		return false
+	}
+	return mergeTreeMatchesWithEnv(ctx, wd, env, base, local, preserved, preserved) ||
+		mergeTreeMatchesWithEnv(ctx, wd, env, base, preserved, local, local)
+}
+
+// mergeTreeMatchesWithEnv is mergeTreePreservesFinalHead evaluated under an
+// object-store overlay: merging ours into theirs on base must yield wantTip's
+// tree exactly.
+func mergeTreeMatchesWithEnv(ctx context.Context, dir string, env []string, base, ours, theirs, wantTip string) bool {
+	merged, err := git.RunWithEnv(ctx, dir, env, "merge-tree", "--write-tree", "--merge-base", base, theirs, ours)
+	if err != nil {
+		return false
+	}
+	want, err := git.RunWithEnv(ctx, dir, env, "rev-parse", wantTip+"^{tree}")
+	return err == nil && merged == want
 }
 
 func reviewedHeadProvesEquivalentTarget(ctx context.Context, dir, local, reviewed, target string) bool {
@@ -1487,9 +1601,16 @@ func (s *Service) recoverRemoteRewritten(ctx context.Context, run *db.Run, keepL
 	if repoErr != nil || repo == nil {
 		return blockedPlan(fresh, StateRemoteRewritten, "blocked_recover_assumptions_changed", "the repository record could not be re-read before rebinding; the push binding was not changed"), true
 	}
+	pushURL := repo.PushURL()
+	if run.Integration != nil {
+		pushURL = s.resolvedPushURL(ctx, repo, run)
+		if pushURL == "" {
+			return blockedPlan(fresh, StateTargetChanged, "blocked_binding_changed", "the selected push target could not be verified before rebinding; the push binding was not changed"), true
+		}
+	}
 	lsCtx, lsCancel := context.WithTimeout(ctx, s.remoteTimeout())
 	defer lsCancel()
-	again, err := s.runLsRemote(lsCtx, s.workDir(), repo.PushURL(), fresh.Target.Ref)
+	again, err := s.runLsRemote(lsCtx, s.workDir(), pushURL, fresh.Target.Ref)
 	if err != nil || again != live {
 		blocked := blockedPlan(fresh, StateRemoteRewritten, "blocked_recover_remote_changed", fmt.Sprintf("the live remote changed again before the push binding could be rebound; the push binding was not changed and the superseded pipeline head stays anchored at %s", anchorRef))
 		blocked.NextAction = &NextAction{Code: "retry", Command: "no-mistakes axi sync --check"}
@@ -1503,7 +1624,7 @@ func (s *Service) recoverRemoteRewritten(ctx context.Context, run *db.Run, keepL
 		Status: run.Status, ExpectedPushed: superseded, ExpectedGeneration: generation,
 		ExpectedHead: run.HeadSHA, PRState: run.PRState, CustodyReturned: run.CustodyReturnedAt != nil,
 		UpstreamURL: repo.UpstreamURL, ForkURL: repo.ForkURL, TargetKind: targetKind(repo),
-		TargetFingerprint: TargetFingerprint(repo.PushURL()), Ref: fresh.Target.Ref, Head: live,
+		TargetFingerprint: TargetFingerprint(runPushURL(repo, run)), Ref: fresh.Target.Ref, Head: live,
 	})
 	if err != nil || !rebound {
 		return blockedPlan(fresh, StateRemoteRewritten, "blocked_recover_assumptions_changed", fmt.Sprintf("the run or its push binding changed before it could be rebound; the push binding was not changed and the superseded pipeline head stays anchored at %s", anchorRef)), true
@@ -1697,8 +1818,8 @@ func (s *Service) AdoptPublished(ctx context.Context) State {
 	if err != nil || repo == nil {
 		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_published_target_unavailable", "the configured push target is unavailable; no files or gate refs were changed")
 	}
-	pushTargetFingerprint := TargetFingerprint(repo.PushURL())
-	pushURL := s.resolvedPushURL(ctx, repo)
+	pushTargetFingerprint := TargetFingerprint(runPushURL(repo, run))
+	pushURL := s.resolvedPushURL(ctx, repo, run)
 	if strings.TrimSpace(pushURL) == "" {
 		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_published_target_unavailable", "the configured push target is unavailable; no files or gate refs were changed")
 	}
@@ -1748,7 +1869,7 @@ func (s *Service) AdoptPublished(ctx context.Context) State {
 		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_published_preserve_failed", "the recovered gate head could not be preserved before lane adoption; no files or gate refs were changed")
 	}
 	currentRepo, err := s.DB.GetRepo(s.Repo.ID)
-	if err != nil || currentRepo == nil || TargetFingerprint(currentRepo.PushURL()) != pushTargetFingerprint {
+	if err != nil || currentRepo == nil || TargetFingerprint(runPushURL(currentRepo, recheckRun)) != pushTargetFingerprint {
 		return blockedPlan(state, StateCustodyReturned, "blocked_adopt_published_target_changed", "the configured push target changed while the published head was being verified; no files or gate refs were changed")
 	}
 	if _, err := git.Run(ctx, s.GateDir, "update-ref", branchRef, state.Local.Head, gateHead); err != nil {
@@ -1761,8 +1882,8 @@ func (s *Service) AdoptPublished(ctx context.Context) State {
 }
 
 // resolvedPushURL answers with the same authoritative push target the rest of
-// this service verifies against: Repo.PushURL(), the configured fork or the
-// registered upstream. Adoption's whole safety argument is that the head it
+// this service verifies against: the configured fork or the run's integration
+// destination. Adoption's whole safety argument is that the head it
 // admits is already published on THAT target, so a worktree remote may stand in
 // for it only to recover a credential the redacted database copy cannot hold,
 // and only when credential-free TargetFingerprint identity proves that the
@@ -1770,8 +1891,17 @@ func (s *Service) AdoptPublished(ctx context.Context) State {
 // somewhere else therefore never decides the adoption; the registered target
 // does, and an unusable credential fails the live check closed rather than
 // verifying against a remote the pipeline does not publish to.
-func (s *Service) resolvedPushURL(ctx context.Context, repo *db.Repo) string {
-	target := repo.PushURL()
+func (s *Service) resolvedPushURL(ctx context.Context, repo *db.Repo, run *db.Run) string {
+	if strings.TrimSpace(repo.ForkURL) == "" && run != nil && run.Integration != nil {
+		// The pin is identity evidence, never a credential source. Only the
+		// same named remote may supply this run's current transport URL.
+		remote, err := run.Integration.RuntimeURL(ctx, s.workDir())
+		if err != nil {
+			return ""
+		}
+		return remote
+	}
+	target := runPushURL(repo, run)
 	if strings.TrimSpace(target) == "" {
 		return ""
 	}
@@ -1883,8 +2013,8 @@ func (s *Service) inspect(ctx context.Context) (State, *db.Run, bool) {
 		PushedHead: ptr(run.LastPushedSHA), PushedAt: value(run.LastPushedAt), PushGeneration: value(run.PushGeneration),
 	}
 	state.PRState = normalizePRState(run.PRState)
-	state.Target = TargetState{Kind: ptr(run.PushTargetKind), URL: displayTarget(s.Repo.PushURL()), Ref: ptr(run.PushRef)}
-	state.Target.Remote = s.remoteName(ctx)
+	state.Target = TargetState{Kind: ptr(run.PushTargetKind), URL: displayTarget(runPushURL(s.Repo, run)), Ref: ptr(run.PushRef)}
+	state.Target.Remote = s.remoteName(ctx, run)
 	state.Remote = RemoteState{ObservedHead: ptr(run.LastPushedSHA), Freshness: "pipeline_push", ObservedAt: value(run.LastPushedAt)}
 
 	if run.PushActive || pushStepRunning(s.DB, run.ID) {
@@ -1948,7 +2078,7 @@ func (s *Service) inspect(ctx context.Context) (State, *db.Run, bool) {
 		state.Safety = "blocked_closed"
 		return state, run, true
 	}
-	if ptr(run.PushRef) != "refs/heads/"+branch || ptr(run.PushTargetFingerprint) != TargetFingerprint(s.Repo.PushURL()) || ptr(run.PushTargetKind) != targetKind(s.Repo) {
+	if ptr(run.PushRef) != "refs/heads/"+branch || ptr(run.PushTargetFingerprint) != TargetFingerprint(runPushURL(s.Repo, run)) || ptr(run.PushTargetKind) != targetKind(s.Repo) {
 		state.State = StateTargetChanged
 		state.Safety = "blocked_target_changed"
 		state.Error = "the configured push target or branch ref changed after the pipeline push"
@@ -2084,18 +2214,21 @@ func mergeTreePreservesFinalHead(ctx context.Context, dir, base, local, pushed s
 	return mergedTree == pushedTree
 }
 
-func (s *Service) remoteName(ctx context.Context) string {
+func (s *Service) remoteName(ctx context.Context, run *db.Run) string {
 	out, err := git.Run(ctx, s.workDir(), "remote")
 	if err == nil {
 		for _, name := range strings.Fields(out) {
 			remoteURL, err := git.GetConfiguredRemoteURL(ctx, s.workDir(), name)
-			if err == nil && TargetFingerprint(remoteURL) == TargetFingerprint(s.Repo.PushURL()) {
+			if err == nil && TargetFingerprint(remoteURL) == TargetFingerprint(runPushURL(s.Repo, run)) {
 				return name
 			}
 		}
 	}
 	if strings.TrimSpace(s.Repo.ForkURL) != "" {
 		return "fork"
+	}
+	if run.Integration != nil {
+		return run.Integration.Remote
 	}
 	return "origin"
 }
@@ -2186,7 +2319,7 @@ func exactPushedBinding(repo *db.Repo, run *db.Run, branch string) bool {
 	return repo != nil && run != nil && run.Branch == branch && !run.PushActive && run.HeadSHA != "" &&
 		run.LastPushedSHA != nil && run.HeadSHA == ptr(run.LastPushedSHA) &&
 		run.PushTargetKind != nil && ptr(run.PushTargetKind) == targetKind(repo) &&
-		run.PushTargetFingerprint != nil && ptr(run.PushTargetFingerprint) == TargetFingerprint(repo.PushURL()) &&
+		run.PushTargetFingerprint != nil && ptr(run.PushTargetFingerprint) == TargetFingerprint(runPushURL(repo, run)) &&
 		run.PushRef != nil && ptr(run.PushRef) == "refs/heads/"+branch &&
 		run.PushGeneration != nil
 }
@@ -2266,9 +2399,12 @@ func (s *Service) classifyPipelineOwned(ctx context.Context, state *State, run *
 		}
 		state.Safety = "blocked_pipeline_owned_recoverable"
 		state.Recovery = source.evidence
-		if source.archive != nil {
+		switch {
+		case source.err != "":
+			state.Error = source.err
+		case source.archive != nil:
 			state.Error = fmt.Sprintf("the run finished %s with divergent later work preserved at verified archive %s; recover custody at exact required head %s before any local follow-up commit", run.Status, source.archive.ArchiveRef, source.archive.RequiredHeadSHA)
-		} else {
+		default:
 			state.Error = "the run finished " + string(run.Status) + " with unpublished pipeline commits preserved in the local gate; recover custody before any local follow-up commit"
 		}
 		action := source.action
@@ -2441,9 +2577,21 @@ func (s *Service) recoverySourceAvailable(ctx context.Context, state *State, run
 		}
 	}
 
-	ordinaryAvailable := localEligible
+	ordinaryAvailable := localEligible || (gateAvailable && objectExists(ctx, gateDir, preserved) && state.Local.Clean &&
+		localCarriesPreservedWork(ctx, s.workDir(), local, preserved))
 	if !ordinaryAvailable && gateAvailable && objectExists(ctx, gateDir, preserved) && state.Local.Clean && objectExists(ctx, gateDir, local) {
-		ordinaryAvailable = isAncestor(ctx, gateDir, local, preserved) || preservedContainsLocalWork(ctx, gateDir, local, preserved)
+		ordinaryAvailable = isAncestor(ctx, gateDir, local, preserved) || preservedContainsLocalWork(ctx, gateDir, local, preserved) ||
+			localCarriesPreservedWork(ctx, gateDir, local, preserved)
+	}
+	if !ordinaryAvailable && gateAvailable && state.Local.Clean && objectExists(ctx, gateDir, preserved) && objectExists(ctx, s.workDir(), local) &&
+		(!objectExists(ctx, gateDir, local) || !objectExists(ctx, s.workDir(), preserved)) {
+		// Neither repository holds both heads (for example a repair committed
+		// only in the worktree while the preserved pipeline head exists only in
+		// the gate), so no single-repository proof above can run. Explicit
+		// recovery imports the preserved head into the worktree anchor before
+		// it compares anything; inspection must agree with the verdict that
+		// import will reach without performing it.
+		ordinaryAvailable = s.crossRepositoryRelationProven(ctx, gateDir, local, preserved)
 	}
 	if ordinaryAvailable {
 		var evidence *RecoveryEvidence
@@ -2466,10 +2614,69 @@ func (s *Service) recoverySourceAvailable(ctx context.Context, state *State, run
 	if archiveProof.available {
 		return archiveProof
 	}
+	if offer, ok := s.pinnedKeepLocalOffer(ctx, state, run); ok {
+		return offer
+	}
 	return unavailableRecoverySource(
 		"blocked_recover_manual_reconciliation",
 		"the run finished "+string(run.Status)+" but its preserved recovery evidence cannot be used safely; inspect and reconcile the recorded and live heads manually",
 	)
+}
+
+// pinnedKeepLocalOffer refuses an unverified terminal head. Recover refuses
+// that head before keep-local, so status must not advertise the command.
+func (s *Service) pinnedKeepLocalOffer(ctx context.Context, state *State, run *db.Run) (recoverySourceProof, bool) {
+	if state == nil || run == nil || !state.Local.Clean || run.TerminalHeadVerifiedAt == nil || !terminalRunStatus(run.Status) || strings.TrimSpace(run.HeadSHA) == "" {
+		return recoverySourceProof{}, false
+	}
+	gateDir := strings.TrimSpace(s.GateDir)
+	if gateDir == "" {
+		return recoverySourceProof{}, false
+	}
+	if _, err := os.Stat(gateDir); err != nil {
+		return recoverySourceProof{}, false
+	}
+	preserved := run.HeadSHA
+	if !objectExists(ctx, gateDir, preserved) {
+		return recoverySourceProof{}, false
+	}
+	ref := custody.RecoveryRef(run.ID)
+	if symbolic, err := git.Run(ctx, gateDir, "symbolic-ref", "-q", ref); err == nil && symbolic != "" {
+		return recoverySourceProof{}, false
+	}
+	anchored, err := git.Run(ctx, gateDir, "rev-parse", "--verify", ref+"^{commit}")
+	if err != nil || anchored != preserved {
+		return recoverySourceProof{}, false
+	}
+	if compatible, err := recoveryAnchorCompatible(ctx, s.workDir(), run.ID, preserved); err != nil || !compatible {
+		return recoverySourceProof{}, false
+	}
+	gateHead, gateHeadExists, err := git.ExactRefTarget(ctx, gateDir, "refs/heads/"+state.Local.Branch)
+	if err != nil {
+		return recoverySourceProof{}, false
+	}
+	if gateHeadExists && gateHead != state.Local.Head && gateHead != preserved {
+		if !objectExists(ctx, gateDir, gateHead) {
+			return recoverySourceProof{}, false
+		}
+		if compatible, err := recoveryGateAnchorCompatible(ctx, gateDir, run.ID, gateHead); err != nil || !compatible {
+			return recoverySourceProof{}, false
+		}
+	}
+	repoID := ""
+	if s.Repo != nil {
+		repoID = s.Repo.ID
+	}
+	return recoverySourceProof{
+		available: true,
+		action:    NextAction{Code: "recover_custody", Command: "no-mistakes axi sync --recover --keep-local"},
+		err:       fmt.Sprintf("the run finished %s; its pipeline commits stay at %s and are not on the branch", run.Status, ref),
+		evidence: &RecoveryEvidence{
+			Source: "pinned_head", RepositoryID: repoID, RunID: run.ID,
+			Branch: state.Local.Branch, RequiredHead: state.Local.Head, PreservedHead: preserved,
+			KeepLocal: true, Proof: "verified",
+		},
+	}, true
 }
 
 func localRecoveryEligible(ctx context.Context, wd string, state *State, run *db.Run) bool {
@@ -2770,7 +2977,27 @@ func samePath(a, b string) bool {
 		}
 		return abs
 	}
-	return resolve(a) == resolve(b)
+	if resolve(a) == resolve(b) {
+		return true
+	}
+	// Spellings that differ only in letter case name one directory on a
+	// case-insensitive volume, and the filesystem is the authority on that.
+	infoA, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	infoB, err := os.Stat(b)
+	return err == nil && os.SameFile(infoA, infoB)
+}
+
+func runPushURL(repo *db.Repo, run *db.Run) string {
+	if repo != nil && strings.TrimSpace(repo.ForkURL) != "" {
+		return repo.ForkURL
+	}
+	if run != nil && run.Integration != nil {
+		return run.Integration.TransportURL
+	}
+	return repo.PushURL()
 }
 
 func targetKind(repo *db.Repo) string {

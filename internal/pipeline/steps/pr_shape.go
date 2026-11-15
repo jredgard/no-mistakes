@@ -7,7 +7,6 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
-	"github.com/kunchenguid/no-mistakes/internal/safepath"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -191,7 +190,8 @@ func publishPRReferences(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, 
 		if !ok {
 			return fmt.Errorf("provider cannot publish the full intent comment")
 		}
-		comment := "## Full intent\n\n" + safepath.RedactText(neutralizeAttestationMarkers(resolvedProviderForBody(sctx), publicPRIntent(sctx)))
+		comment := "## Full intent\n\n" + neutralizeAttestationMarkers(resolvedProviderForBody(sctx), publicPRIntent(sctx))
+		comment = redactPRContent(prContent{Body: comment}, sctx.WorkDir, nmWorktreesRoot()).Body
 		if err := publisher.EnsurePRComment(sctx.Ctx, pr, comment); err != nil {
 			return fmt.Errorf("publish full intent comment: %w", err)
 		}

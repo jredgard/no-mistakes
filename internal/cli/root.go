@@ -84,6 +84,7 @@ func newRootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&skipValue, "skip", "", "comma-separated pipeline steps to skip for a new run")
 
 	cmd.AddCommand(newInitCmd())
+	cmd.AddCommand(newSkillCmd())
 	cmd.AddCommand(newCIWorkflowCmd())
 	cmd.AddCommand(newEjectCmd())
 	cmd.AddCommand(newUpdateCmd())
@@ -94,6 +95,7 @@ func newRootCmd() *cobra.Command {
 	cmd.AddCommand(newSyncCmd())
 	cmd.AddCommand(newRunsCmd())
 	cmd.AddCommand(newStatsCmd())
+	cmd.AddCommand(newExportCmd())
 	cmd.AddCommand(newDoctorCmd())
 	cmd.AddCommand(newEvalCmd())
 	cmd.AddCommand(newAxiCmd())

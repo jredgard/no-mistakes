@@ -33,7 +33,7 @@ func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	branchTarget := ""
 	pushRemote := resolveUpstreamURL(sctx)
 	if branch != "" {
-		branchTarget = "origin/" + branch
+		branchTarget = runIntegrationRef(sctx, branch)
 		if strings.TrimSpace(sctx.Repo.ForkURL) != "" {
 			pushRemote = sctx.Repo.PushURL()
 			branchTarget = forkBranchTrackingRef(branch)
@@ -71,14 +71,14 @@ func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	}
 
 	// Stop before rebasing when the gated branch carries commits that live on
-	// the contributor's local default branch but were never pushed to
-	// origin/<default>. Rebasing onto the fresh remote default keeps those
-	// commits in the branch's history, so the PR may bundle another
+	// the contributor's local default branch but were never pushed to the
+	// run's integration base. Rebasing onto that fresh base keeps those commits
+	// in the branch's history, so the PR may bundle another
 	// workstream's unpushed work. Surface the ambiguity for a human decision.
 	if outcome := detectBundledLocalDefaultCommits(ctx, sctx, branch, defaultBranch); outcome != nil {
 		return outcome, nil
 	}
-	if forcePush && branch == defaultBranch && remoteDefaultBranchAdvanced(ctx, sctx.WorkDir, defaultBranch, sctx.Run.BaseSHA) {
+	if forcePush && branch == defaultBranch && remoteDefaultBranchAdvanced(ctx, sctx.WorkDir, defaultBranch, sctx.Run.BaseSHA, runIntegrationRef(sctx, defaultBranch)) {
 		findingsJSON, _ := json.Marshal(Findings{
 			Items: []Finding{{
 				Severity:    "warning",
@@ -97,6 +97,13 @@ func (s *RebaseStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	if forcePush {
 		sctx.Log("force push detected, skipping " + branchTarget + " sync")
 		targets = forcePushRebaseTargets(branch, defaultBranch)
+	}
+	if sctx.Run.Integration != nil {
+		for i, target := range targets {
+			if target == "origin/"+defaultBranch {
+				targets[i] = runIntegrationRef(sctx, defaultBranch)
+			}
+		}
 	}
 
 	merging := mergesMovedBase(sctx)
@@ -217,15 +224,15 @@ func effectivePRBaseBranch(sctx *pipeline.StepContext) string {
 
 // detectBundledLocalDefaultCommits returns a blocking finding when the gated
 // branch carries commits that exist on the contributor's local default branch
-// but were never pushed to origin/<default>. In multi-session / monorepo setups
-// the local default branch routinely carries another workstream's unpushed
+// but were never pushed to the run's integration base. In multi-session /
+// monorepo setups the local default branch carries another workstream's unpushed
 // work; branching a fix off that local tip silently drags it into the PR when
 // the branch is rebased onto the remote default. Returns nil when no such
 // divergence is detected so the run proceeds normally.
 //
 // It only flags commits the branch actually carries: it reads the local default
-// tip from the working repo, confirms that tip is ahead of origin/<default> and
-// is a strict ancestor of the branch HEAD, then enumerates the unpushed commits.
+// tip from the working repo, confirms that tip is ahead of the fetched integration
+// base and is a strict ancestor of branch HEAD, then enumerates unpushed commits.
 // Equal tips are the common commit-on-main-then-name-a-branch workflow, not
 // evidence of an additional bundled workstream.
 // Detection is best-effort - if the local default tip advanced past the branch
@@ -246,7 +253,7 @@ func detectBundledLocalDefaultCommits(ctx context.Context, sctx *pipeline.StepCo
 	if localTip == "" {
 		return nil
 	}
-	remoteRef := "origin/" + defaultBranch
+	remoteRef := runIntegrationRef(sctx, defaultBranch)
 	if _, err := git.Run(ctx, sctx.WorkDir, "rev-parse", "--verify", "--quiet", remoteRef+"^{commit}"); err != nil {
 		return nil
 	}
@@ -330,11 +337,15 @@ func isAncestor(ctx context.Context, workDir, ancestor, descendant string) bool 
 	return err == nil
 }
 
-func remoteDefaultBranchAdvanced(ctx context.Context, workDir, defaultBranch, baseSHA string) bool {
+func remoteDefaultBranchAdvanced(ctx context.Context, workDir, defaultBranch, baseSHA string, refs ...string) bool {
 	if baseSHA == "" || git.IsZeroSHA(baseSHA) {
 		return false
 	}
-	remoteSHA, err := git.Run(ctx, workDir, "rev-parse", "--verify", "origin/"+defaultBranch)
+	ref := "origin/" + defaultBranch
+	if len(refs) > 0 {
+		ref = refs[0]
+	}
+	remoteSHA, err := git.Run(ctx, workDir, "rev-parse", "--verify", ref)
 	if err != nil {
 		return false
 	}
@@ -410,7 +421,7 @@ func tryRebase(ctx context.Context, sctx *pipeline.StepContext, targetRef string
 	}
 
 	sctx.Log(fmt.Sprintf("rebasing onto %s...", targetRef))
-	if _, err := git.Run(ctx, sctx.WorkDir, "rebase", targetRef); err != nil {
+	if _, err := git.Run(ctx, sctx.WorkDir, "-c", "rerere.enabled=false", "rebase", targetRef); err != nil {
 		conflictFiles := rebaseConflictFiles(ctx, sctx.WorkDir)
 		_, _ = git.Run(ctx, sctx.WorkDir, "rebase", "--abort")
 
@@ -433,7 +444,7 @@ func rebaseWithAgent(ctx context.Context, sctx *pipeline.StepContext, targetRef 
 	}
 
 	sctx.Log(fmt.Sprintf("rebasing onto %s...", targetRef))
-	if _, err := git.Run(ctx, sctx.WorkDir, "rebase", targetRef); err == nil {
+	if _, err := git.Run(ctx, sctx.WorkDir, "-c", "rerere.enabled=false", "rebase", targetRef); err == nil {
 		return nil
 	}
 
@@ -515,8 +526,11 @@ func integrationVerb(merging bool) string {
 // --no-edit keeps git's own "Merge remote-tracking branch 'origin/main' into
 // <branch>" subject rather than inventing a second convention for the same
 // commit.
+// rerere.enabled=false (also on both rebase calls) keeps an operator's global
+// rerere from pre-staging a saved resolution, which still exits 1 and would be
+// misreported as a failed non-conflict integration.
 func mergeArgs(targetRef string) []string {
-	return []string{"merge", "--no-ff", "--no-edit", targetRef}
+	return []string{"-c", "rerere.enabled=false", "merge", "--no-ff", "--no-edit", targetRef}
 }
 
 // tryMerge is merge mode's counterpart to tryRebase: it attempts to merge
@@ -825,7 +839,10 @@ func updateHeadSHA(ctx context.Context, sctx *pipeline.StepContext) (*pipeline.S
 	// so reuse that ref instead of fetching again after HEAD was rewritten and
 	// persisted: a failure here could not undo either.
 	defaultBranch := effectivePRBaseBranch(sctx)
-	baseSHA := mergeBaseWithDefaultBranch(ctx, sctx.WorkDir, defaultBranch)
+	baseSHA, err := mergeBaseWithRunBranch(ctx, sctx, defaultBranch)
+	if err != nil {
+		return nil, err
+	}
 	if baseSHA == "" {
 		baseSHA = resolveBaseSHA(ctx, sctx.WorkDir, sctx.Run.BaseSHA, defaultBranch)
 	}

@@ -31,12 +31,12 @@ func TestCompactPRShapeKeepsPublicationRedaction(t *testing.T) {
 func TestFullIntentCommentRedactsHomePathsAndForeignAttestations(t *testing.T) {
 	t.Parallel()
 	foreign := pipelineAttestationCommentPrefix + `{"head_sha":"foreign","steps":[]}` + pipelineAttestationCommentClosingToken
-	sctx := &pipeline.StepContext{Ctx: context.Background(), UserIntent: "Inspect " + fixtureHome + "/tmp. " + foreign}
+	sctx := &pipeline.StepContext{Ctx: context.Background(), WorkDir: "/srv/task-checkout", UserIntent: "Inspect " + fixtureHome + "/tmp and /srv/task-checkout/source.go. " + foreign}
 	host := &referenceHost{}
 	if err := publishPRReferences(sctx, host, &scm.PR{Number: "42"}, fullIntentCommentNote); err != nil {
 		t.Fatal(err)
 	}
-	if len(host.comments) != 1 || strings.Contains(host.comments[0], fixtureHome) || strings.Contains(host.comments[0], pipelineAttestationCommentPrefix) || !strings.Contains(host.comments[0], "~/tmp") || !strings.Contains(host.comments[0], "foreign") {
+	if len(host.comments) != 1 || strings.Contains(host.comments[0], fixtureHome) || strings.Contains(host.comments[0], pipelineAttestationCommentPrefix) || !strings.Contains(host.comments[0], "~/tmp") || !strings.Contains(host.comments[0], "foreign") || strings.Contains(host.comments[0], sctx.WorkDir) || !strings.Contains(host.comments[0], "{run-worktree}/source.go") {
 		t.Fatalf("comment privacy boundary failed: %v", host.comments)
 	}
 }

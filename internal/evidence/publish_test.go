@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kunchenguid/no-mistakes/internal/git"
 )
 
 // Ambient GIT_CONFIG_* injection from agent harnesses would leak into every
@@ -484,5 +486,94 @@ func TestPublish_RedactsHomePathsInTextEvidence(t *testing.T) {
 	}
 	if local, err := os.ReadFile(filepath.Join(source, "logs", "run.txt")); err != nil || string(local) != text {
 		t.Errorf("local evidence = %q (%v), want it untouched", local, err)
+	}
+}
+
+func TestPublish_RedactsRunWorktreePathsInTextEvidence(t *testing.T) {
+	remote, work := newRepoWithRemote(t)
+	// An NM_HOME outside the home directory, which home redaction never sees.
+	worktrees := filepath.Join(t.TempDir(), "nm-home", "worktrees")
+	runWorktree := filepath.Join(worktrees, "ab12cd34ef56", "run-1")
+	text := "ran " + runWorktree + "/bin/tool\n" +
+		"cd " + runWorktree + "\n" +
+		"saw " + filepath.Join(worktrees, "0f0f0f0f0f0f", "run-0", "out.log") + "\n" +
+		"listed " + worktrees + " and " + filepath.Join(worktrees, "0f0f0f0f0f0f") + "\n" +
+		"kept " + runWorktree + "-old/x\n"
+	source := writeEvidence(t, t.TempDir(), map[string]string{"logs/run.txt": text})
+
+	req := baseRequest(remote, work, source)
+	req.RunWorktree = runWorktree
+	req.WorktreesRoot = worktrees
+	result, err := Publish(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	got := runGit(t, remote, "cat-file", "-p", result.CommitSHA+":.no-mistakes/evidence/fm/add-login/logs/run.txt")
+	want := "ran {run-worktree}/bin/tool\n" +
+		"cd {run-worktree}\n" +
+		"saw " + filepath.Join("{run-worktree}", "out.log") + "\n" +
+		"listed {worktrees} and {worktrees}\n" +
+		"kept {run-worktree}/x"
+	if got != want {
+		t.Errorf("published text = %q, want %q", got, want)
+	}
+	if local, err := os.ReadFile(filepath.Join(source, "logs", "run.txt")); err != nil || string(local) != text {
+		t.Errorf("local evidence = %q (%v), want it untouched", local, err)
+	}
+}
+
+func TestPublishCommitIdentityBoundAndUnboundContexts(t *testing.T) {
+	for _, mode := range []string{"bound", "configured", "fallback", "invalid bound"} {
+		t.Run(mode, func(t *testing.T) {
+			remote, work := newRepoWithRemote(t)
+			source := writeEvidence(t, t.TempDir(), map[string]string{"proof.txt": "synthetic proof\n"})
+			identity := git.CommitIdentity{AuthorName: "Submitting Author", AuthorEmail: "author@example.test", CommitterName: "Submitting Committer", CommitterEmail: "committer@example.test"}
+			ctx := context.Background()
+			want := "Evidence Test <evidence@example.com> | Evidence Test <evidence@example.com>"
+			switch mode {
+			case "bound":
+				if err := git.CopyLocalUserIdentity(ctx, work, identity); err != nil {
+					t.Fatal(err)
+				}
+				ctx = git.WithCommitIdentity(ctx, identity)
+				want = "Submitting Author <author@example.test> | Submitting Committer <committer@example.test>"
+			case "fallback":
+				runGit(t, work, "config", "--unset", "user.name")
+				runGit(t, work, "config", "--unset", "user.email")
+				want = "no-mistakes <no-mistakes@localhost> | no-mistakes <no-mistakes@localhost>"
+			case "invalid bound":
+				identity.AuthorEmail = ""
+				ctx = git.WithCommitIdentity(ctx, identity)
+			}
+			for _, role := range []string{"AUTHOR", "COMMITTER"} {
+				t.Setenv("GIT_"+role+"_NAME", "Daemon")
+				t.Setenv("GIT_"+role+"_EMAIL", "daemon@example.test")
+			}
+			result, err := Publish(ctx, baseRequest(remote, work, source))
+			if mode == "invalid bound" {
+				if err == nil {
+					t.Fatalf("invalid bound identity published: %+v", result)
+				}
+				runGitFails(t, remote, "rev-parse", "--verify", "refs/heads/"+DefaultBranch)
+				return
+			}
+			if err != nil || result == nil {
+				t.Fatalf("publish: %+v, %v", result, err)
+			}
+			if got := runGit(t, remote, "show", "-s", "--format=%an <%ae> | %cn <%ce>", result.CommitSHA); got != want {
+				t.Fatalf("evidence identity = %q, want %q", got, want)
+			}
+			writeEvidence(t, source, map[string]string{"proof.txt": "second synthetic proof\n"})
+			next, err := Publish(ctx, baseRequest(remote, work, source))
+			if err != nil || next == nil {
+				t.Fatalf("append evidence: %+v, %v", next, err)
+			}
+			if got := runGit(t, remote, "show", "-s", "--format=%an <%ae> | %cn <%ce>", next.CommitSHA); got != want {
+				t.Fatalf("appended evidence identity = %q, want %q", got, want)
+			}
+			if got := runGit(t, remote, "rev-parse", next.CommitSHA+"^"); got != result.CommitSHA {
+				t.Fatalf("appended evidence parent = %q, want %q", got, result.CommitSHA)
+			}
+		})
 	}
 }

@@ -86,7 +86,7 @@ If you have multiple installs with different `NM_HOME` roots, each gets its own 
 
 ## `no-mistakes update` refuses or aborts
 
-Symptom: `update` refuses because active pipeline runs are in progress, prompts because the daemon is running from a different executable path, or aborts because the daemon executable path cannot be determined.
+Symptom: `update` refuses because active pipeline runs are in progress (`--when-idle` lets them finish instead, unless the running daemon is too old to wait), prompts because the daemon is running from a different executable path, or aborts because the daemon executable path cannot be determined.
 
 `update`, `daemon stop`, and `daemon restart` all refuse by default while pipeline runs are active and list the affected runs; [Daemon & Worktrees](/no-mistakes/concepts/daemon/#starting-and-stopping) owns the guard's exact rules, including why `-y`/`--yes` does not bypass it.
 
@@ -179,6 +179,17 @@ The retry keeps every committed correction, carries the steps before the failed 
 It refuses, naming the proof that failed, when the failure is about the change itself, the branch or head moved, or the configuration changed; use `no-mistakes rerun` then.
 See [`no-mistakes axi retry`](/no-mistakes/reference/cli/#no-mistakes-axi-retry) for every proof.
 
+### A run pushed, then failed in PR or CI
+
+When Push succeeded and the PR or CI step then failed, for example on a transient forge API error, continue only the delivery:
+
+```sh
+no-mistakes axi retry --run <id>
+```
+
+The new run carries every validation step and Push, runs only PR and CI, and never pushes.
+It refuses when the remote branch cannot be read or no longer has the run's pushed head; use `no-mistakes rerun` then.
+
 ### Push fails with `refusing to force-push`
 
 This means the live remote branch changed after the pipeline's last observed head and contains commit(s) the validated worktree did not incorporate.
@@ -234,10 +245,9 @@ A branch that touches no `.github/workflows/*.yml` or `*.yaml` pushes normally w
 
 ### Rebase pauses because the branch carries unpushed default-branch commits
 
-This means a local default branch ahead of `origin/<default_branch>` is a strict ancestor of your branch, so the branch may contain unrelated local-default work.
-`no-mistakes` pauses with an `ask-user` finding instead of silently bundling that ambiguous work into the PR. If the local default tip and your branch `HEAD` are equal, it treats the commits as the intended delivery work and continues.
+The branch may contain unrelated local-default work. The [Rebase reference](/no-mistakes/reference/pipeline-steps/#rebase) owns the exact conditions for this pause.
 
-Push the default branch to `origin` if those commits belong in the shared base, or rebuild the feature branch from `origin/<default_branch>` to remove the unrelated work before running the gate again.
+Publish those commits to the run's integration base if they belong in the shared base, or rebuild the feature branch from that base to remove the unrelated work before running the gate again.
 Approve the finding only when you have confirmed the local default-branch work belongs in the delivery branch.
 
 ## `git push no-mistakes` doesn't start a pipeline
@@ -252,6 +262,7 @@ git remote -v | grep no-mistakes
 
 If it's missing, run `no-mistakes init` again.
 Re-running init refreshes an existing gate and repairs the `no-mistakes` remote when it is missing.
+If init instead refuses because the remote already exists with another URL, it leaves that remote alone; when the `.git` is shared with another no-mistakes home, follow the `url.<base>.insteadOf` rewrite the refusal prints (see [`no-mistakes init`](/no-mistakes/reference/cli/#no-mistakes-init)).
 It also reattaches an existing gate after you rename or move the repo directory, as long as the old path no longer exists.
 
 ### Check the receive hooks
@@ -295,7 +306,7 @@ Check the [Provider Integration](/no-mistakes/guides/provider-integration/) requ
 - Self-hosted GitHub Enterprise on a hostname that is not `github.com` isn't detected because `gh` isn't configured for the host; run `gh auth login --hostname your-ghe.example.com` so detection finds it. Once detection succeeds, the availability check is host-scoped (`gh auth status --hostname your-ghe.example.com`), so a stale token on `github.com` or any other configured gh host can no longer falsely mark the GHE repo as unauthenticated.
 - Self-hosted GitLab on a hostname with no `gitlab` marker isn't detected because `glab` isn't configured for the host; run `glab auth login --hostname your-gitlab.example.com` so detection finds it. Once detection succeeds, the availability check is host-scoped (`glab auth status --hostname your-gitlab.example.com`), so a stale token on `gitlab.com` or any other configured glab host can no longer falsely mark the self-hosted repo as unauthenticated.
 - Self-hosted Gitea isn't detected because `tea` has no login configured for the host; run `tea logins add --url https://your-gitea.example.com --token <token> --name <name>` (tea 0.x) or `tea auth login --host https://your-gitea.example.com --with-token < token-file` (tea 1.0) so detection finds it. tea 1.0 does not read tea 0.x logins, so after upgrading tea the PR step is skipped with `no tea 1.0 account configured` until you log in again. See [Self-hosted Gitea](/no-mistakes/guides/provider-integration/#self-hosted-gitea).
-- Self-hosted Forgejo reached over an SSH origin isn't detected until `FORGEJO_BASE_URL` is set in the daemon's environment; when the instance serves SSH from a hostname other than its web host (Forgejo's `SSH_DOMAIN` setting), also set `FORGEJO_SSH_DOMAIN`, or the origin still fails to match the instance. See [Forgejo](/no-mistakes/guides/provider-integration/#forgejo).
+- The integration remote isn't recognized as Forgejo. Check [`FORGEJO_BASE_URL`](/no-mistakes/reference/environment/#forgejo_base_url) and, for a separate SSH hostname, [`FORGEJO_SSH_DOMAIN`](/no-mistakes/reference/environment/#forgejo_ssh_domain).
 - `FORGEJO_SSH_DOMAIN` is set, but a `tea` login for the same host, such as one left from an earlier split-host workaround, is matched first and routes the repository to Gitea; with `tea` not installed or not logged in, the PR step is skipped with `tea CLI is not installed` or `tea CLI is not authenticated`. Remove the login with `tea logins delete <name>` (tea 0.x) or `tea auth logout --host <url>` (tea 1.0). See [`FORGEJO_SSH_DOMAIN`](/no-mistakes/reference/environment/#forgejo_ssh_domain).
 - A non-GitHub repo record has a fork URL set; fork MR/PR routing is currently GitHub-only
 - You pushed the effective PR base branch (see the [PR step's skip rules](/no-mistakes/reference/pipeline-steps/#pr))
@@ -304,7 +315,7 @@ Check the [Provider Integration](/no-mistakes/guides/provider-integration/) requ
 
 Symptom: CI step keeps monitoring an open PR longer than expected, or pauses after the idle timeout.
 
-By default, the run keeps monitoring the pull request after CI readiness is established, and ends when the PR is merged or closed. Ending it at readiness instead requires [`ci.release_after_checks_pass`](/no-mistakes/reference/repo-config/#cirelease_after_checks_pass). If the run has not finished, consult the [CI readiness rules](/no-mistakes/reference/pipeline-steps/#ci), including unresolved mergeability and checks missing from the PR rollup.
+By default, the run keeps monitoring the pull request after CI readiness is established, and ends when the PR is merged or closed, or when you explicitly hand it to human reviewers with [`no-mistakes axi handoff`](/no-mistakes/reference/cli/#no-mistakes-axi-handoff); handoff ends monitoring without cancelling, merging, or closing the PR. Ending it at readiness instead requires [`ci.release_after_checks_pass`](/no-mistakes/reference/repo-config/#cirelease_after_checks_pass). If the run has not finished, consult the [CI readiness rules](/no-mistakes/reference/pipeline-steps/#ci), including unresolved mergeability and checks missing from the PR rollup.
 
 How long the monitor runs is controlled by `ci_timeout` in `~/.no-mistakes/config.yaml`, an idle timeout that re-arms whenever the upstream default branch advances; the [`ci_timeout` field reference](/no-mistakes/reference/global-config/#ci_timeout) owns the default, the `unlimited` keyword and its aliases, and the exact re-arm semantics.
 Older config files may still contain an explicit `ci_timeout: "4h"` value; update it if you want the newer default behavior.
@@ -312,7 +323,7 @@ Older config files may still contain an explicit `ci_timeout: "4h"` value; updat
 If the PR is still open at the timeout, the step pauses for approval with findings for the open monitoring state or any known unresolved failures.
 You can approve, fix, skip, or abort from the TUI or `no-mistakes axi respond`.
 
-A park that happens **before** the timeout, with a finding that CI checks could not be read from the provider, means the check read itself is failing (after 6 consecutive failed polls, the step stops waiting instead of spinning to `ci_timeout`). The finding is provider-neutral and the step log shows the underlying provider error; for GitHub, a `gh` older than 2.50 rejects the `gh pr checks --json` call and needs upgrading. The same park on GitLab, Forgejo, Bitbucket Cloud, Azure DevOps, Gitea, or a provider plugin points at that provider's CLI, credentials, or plugin instead. For GitLab's "waiting for the delivered commit's own checks" message, see [CI source-commit binding](/no-mistakes/reference/pipeline-steps/#ci).
+A park that happens **before** the timeout, with a finding that CI checks could not be read from the provider, means the check read itself is failing (after 6 consecutive failed polls, the step stops waiting instead of spinning to `ci_timeout`). The finding is provider-neutral and the step log shows the underlying provider error; for GitHub, the finding adds a `gh >= 2.50` hint only when `gh` itself rejected the `pr checks --json` flag (a `gh` older than 2.50 does), and any other error is reported without a version diagnosis. The same park on GitLab, Forgejo, Bitbucket Cloud, Azure DevOps, Gitea, or a provider plugin points at that provider's CLI, credentials, or plugin instead. For GitLab's "waiting for the delivered commit's own checks" message, see [CI source-commit binding](/no-mistakes/reference/pipeline-steps/#ci).
 Use `no-mistakes axi abort` only when you mean to cancel the whole active run.
 
 ## Step looks quiet or wedged

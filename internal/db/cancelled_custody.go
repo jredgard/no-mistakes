@@ -20,14 +20,14 @@ func (d *DB) ReturnCancelledPublishedCustody(run *Run, repo *Repo) (bool, error)
 		WHERE id = ? AND repo_id = ? AND branch = ? AND status = ? AND custody_returned_at IS NULL
 		AND head_sha = ? AND last_pushed_sha = ? AND push_generation = ? AND terminal_head_verified_at = ?
 		AND push_target_kind = ? AND push_target_fingerprint = ? AND push_ref = ? AND COALESCE(push_active, 0) = 0
-		AND pr_state IS ? AND COALESCE(pr_state, '') NOT IN ('merged', 'closed')
+		AND integration_destination IS ? AND pr_state IS ? AND COALESCE(pr_state, '') NOT IN ('merged', 'closed')
 		AND NOT EXISTS (SELECT 1 FROM runs other WHERE other.repo_id = runs.repo_id AND other.branch = runs.branch AND other.id <> runs.id
-			AND other.status NOT IN (?, ?, ?, ?))
+			AND other.status NOT IN (?, ?, ?, ?, ?, ?))
 		AND EXISTS (SELECT 1 FROM repos WHERE repos.id = runs.repo_id AND repos.upstream_url = ? AND COALESCE(repos.fork_url, '') = ?)`,
 		now(), now(), run.ID, repo.ID, run.Branch, string(types.RunCancelled),
 		run.HeadSHA, *run.LastPushedSHA, *run.PushGeneration, *run.TerminalHeadVerifiedAt,
-		*run.PushTargetKind, *run.PushTargetFingerprint, *run.PushRef, run.PRState,
-		string(types.RunCompleted), string(types.RunFailed), string(types.RunCancelled), string(types.RunCIMonitorInterrupted),
+		*run.PushTargetKind, *run.PushTargetFingerprint, *run.PushRef, run.Integration, run.PRState,
+		string(types.RunCompleted), string(types.RunFailed), string(types.RunCancelled), string(types.RunChecksPassed), string(types.RunCIMonitorInterrupted), string(types.RunHandedOff),
 		repo.UpstreamURL, repo.ForkURL)
 	if err != nil {
 		return false, fmt.Errorf("return cancelled published custody: %w", err)

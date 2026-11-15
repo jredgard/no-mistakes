@@ -55,6 +55,9 @@ func handleFakeCLI(mode string) {
 	if logFile != "" {
 		f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if f != nil {
+			if os.Getenv("FAKE_CLI_LOG_REPO") == "1" {
+				fmt.Fprintln(f, "GITLAB_REPO="+os.Getenv("GITLAB_REPO"))
+			}
 			fmt.Fprintln(f, strings.Join(args, " "))
 			f.Close()
 		}
@@ -66,8 +69,14 @@ func handleFakeCLI(mode string) {
 		fakeGHHandler(args)
 	case "glab":
 		fakeGlabHandler(args)
+	case "az-empty-pr":
+		fakeAzureEmptyPRHandler(args)
 	case "record-success":
 		fakeRecordSuccessHandler()
+	case "pr-appendix-verify":
+		fakePRAppendixVerifyHandler(args)
+	case "pr-appendix-identity":
+		fakePRAppendixIdentityHandler(args)
 	case "git-passthrough":
 		fakeGitPassthroughHandler(args)
 	case "git-move-head-passthrough":
@@ -129,6 +138,47 @@ func fakeCIAzureDevOpsHandler(args []string) {
 		fmt.Printf(`{"pullRequestId":42,"status":"active","mergeStatus":%q,"targetRefName":"refs/heads/main"}`+"\n", os.Getenv("FAKE_CLI_MERGEABLE"))
 	default:
 		fmt.Fprintln(os.Stderr, "unexpected Azure DevOps command: "+joined)
+		os.Exit(1)
+	}
+}
+
+func fakePRAppendixIdentityHandler(args []string) {
+	name := strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe")
+	joined := strings.Join(args, " ")
+	if len(args) >= 2 && args[0] == "auth" && args[1] == "status" {
+		if (name == "gh" && strings.Contains(joined, "github.com")) || (name == "glab" && strings.Contains(joined, "gitlab.com")) || name == "origin" {
+			return
+		}
+		os.Exit(1)
+	}
+	if len(args) > 0 && args[0] == "status" {
+		fmt.Println(os.Getenv("FAKE_CLI_STATUS_JSON"))
+		return
+	}
+	if name == "az" && len(args) > 0 && (args[0] == "extension" || args[0] == "devops") {
+		return
+	}
+	if name == "tea" && (strings.Contains(joined, "--help") || strings.HasSuffix(joined, "/user")) {
+		fmt.Println("{}")
+		return
+	}
+	if (len(args) >= 2 && ((args[0] == "pr" && args[1] == "view") || (args[0] == "mr" && args[1] == "view"))) ||
+		(name == "az" && strings.HasPrefix(joined, "repos pr show ")) ||
+		(len(args) > 0 && args[0] == "api" && (name == "tea" || name == "forgejo-axi")) {
+		fmt.Println(os.Getenv("FAKE_CLI_PR_CONTENT_JSON"))
+		return
+	}
+	os.Exit(1)
+}
+
+func fakePRAppendixVerifyHandler(args []string) {
+	switch {
+	case len(args) > 0 && args[0] == "status":
+		fmt.Println(os.Getenv("FAKE_CLI_STATUS_JSON"))
+	case len(args) >= 3 && args[0] == "api" && args[1] == "GET",
+		len(args) >= 3 && args[0] == "pr" && args[1] == "view":
+		fmt.Println(os.Getenv("FAKE_CLI_PR_CONTENT_JSON"))
+	default:
 		os.Exit(1)
 	}
 }
@@ -233,6 +283,61 @@ func fakeRecordSuccessHandler() {
 }
 
 func fakeGHHandler(args []string) {
+	if len(args) > 0 && args[0] == "api" && !isFakeGHPRPatch(args) {
+		if raw, ok := os.LookupEnv("FAKE_CLI_PR_PROOF_JSON"); ok {
+			if os.Getenv("FAKE_CLI_PR_PROOF_FAIL") == "1" {
+				os.Exit(1)
+			}
+			if os.Getenv("FAKE_CLI_PR_PROOF_AFTER_UPDATE") == "1" {
+				body, _ := os.ReadFile(os.Getenv("FAKE_CLI_PR_BODY_FILE"))
+				if len(body) == 0 {
+					raw = os.Getenv("FAKE_CLI_PR_PROOF_INITIAL_JSON")
+				}
+			}
+			fmt.Print(raw)
+			os.Exit(0)
+		}
+		// Default PR fixtures represent the real local commit that their Push
+		// fixture published. Fault tests supply an independent explicit object.
+		for _, arg := range args {
+			if !fakeGHPullEndpoint.MatchString(arg) {
+				continue
+			}
+			head, err := exec.Command(os.Getenv("FAKE_CLI_REAL_GIT"), "rev-parse", "HEAD").Output()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			parts := strings.Split(arg, "/")
+			repo := parts[1] + "/" + parts[2]
+			host, ok := fakeCLIFlagValue(args, "--hostname")
+			if !ok {
+				host = "github.com"
+			}
+			source := os.Getenv("FAKE_CLI_PR_SOURCE_REPO")
+			if source == "" {
+				source = repo
+			}
+			branch := "feature"
+			if data, err := os.ReadFile(os.Getenv("FAKE_CLI_PR_BODY_FILE") + ".branch"); err == nil {
+				branch = string(data)
+			}
+			if b := os.Getenv("FAKE_CLI_PR_HEAD_BRANCH"); b != "" {
+				branch = b
+			}
+			number, _ := strconv.Atoi(parts[4])
+			state := os.Getenv("FAKE_CLI_PR_STATE")
+			if state == "" {
+				state = "OPEN"
+			}
+			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+				"number": number, "html_url": "https://" + host + "/" + repo + "/pull/" + parts[4], "state": strings.ToLower(state), "merged": state == "MERGED",
+				"base": map[string]any{"repo": map[string]any{"full_name": repo}},
+				"head": map[string]any{"ref": branch, "sha": strings.TrimSpace(string(head)), "repo": map[string]any{"full_name": source, "owner": map[string]string{"login": strings.Split(source, "/")[0]}}},
+			})
+			os.Exit(0)
+		}
+	}
 	fakeGHHandlePRContentCommands(args, strings.Join(args, " "))
 	prURL := os.Getenv("FAKE_CLI_PR_URL")
 	prBase := os.Getenv("FAKE_CLI_PR_BASE")
@@ -241,6 +346,11 @@ func fakeGHHandler(args []string) {
 		os.Exit(0)
 	}
 	if len(args) >= 2 && args[0] == "pr" && args[1] == "list" {
+		if branch, ok := fakeCLIFlagValue(args, "--head"); ok {
+			if path := os.Getenv("FAKE_CLI_PR_BODY_FILE"); path != "" {
+				_ = os.WriteFile(path+".branch", []byte(branch), 0o644)
+			}
+		}
 		if hasPRListJSON {
 			fmt.Print(prListJSON)
 			os.Exit(0)
@@ -261,6 +371,13 @@ func fakeGHHandler(args []string) {
 		os.Exit(0)
 	}
 	if len(args) >= 2 && args[0] == "pr" && args[1] == "view" {
+		if fields, _ := fakeCLIFlagValue(args, "--json"); fields == "baseRefName" {
+			if prBase == "" {
+				prBase = "main"
+			}
+			fmt.Println(prBase)
+			os.Exit(0)
+		}
 		if strings.Contains(strings.Join(args, " "), "--json state") {
 			state := os.Getenv("FAKE_CLI_PR_STATE")
 			if state == "" {
@@ -283,7 +400,23 @@ func fakeGHHandler(args []string) {
 			os.Exit(0)
 		}
 		fakeGHStorePRBody(args)
-		fmt.Println("https://github.com/test/repo/pull/99")
+		if os.Getenv("FAKE_CLI_PR_CREATE_REWRITE_BODY") == "1" {
+			if path := os.Getenv("FAKE_CLI_PR_BODY_FILE"); path != "" {
+				if data, err := os.ReadFile(path); err == nil {
+					_ = os.WriteFile(path, append(data, []byte("\nrewritten by host\n")...), 0o644)
+				}
+			}
+		}
+		repo, ok := fakeCLIFlagValue(args, "--repo")
+		if !ok {
+			repo = "test/repo"
+		}
+		host := "github.com"
+		parts := strings.Split(repo, "/")
+		if len(parts) == 3 {
+			host, repo = parts[0], strings.Join(parts[1:], "/")
+		}
+		fmt.Println("https://" + host + "/" + repo + "/pull/99")
 		os.Exit(0)
 	}
 	os.Exit(1)
@@ -454,6 +587,29 @@ func fakeGitRemoteErrorHandler(args []string) {
 }
 
 func fakePRHeadSHA() string {
+	if raw := os.Getenv("FAKE_CLI_PR_HEAD_SEQUENCE"); raw != "" {
+		var heads []string
+		if err := json.Unmarshal([]byte(raw), &heads); err != nil || len(heads) == 0 {
+			os.Exit(1)
+		}
+		indexPath := os.Getenv("FAKE_CLI_PR_HEAD_INDEX")
+		index := 0
+		if data, err := os.ReadFile(indexPath); err == nil {
+			index, _ = strconv.Atoi(string(data))
+		}
+		if err := os.WriteFile(indexPath, []byte(strconv.Itoa(index+1)), 0o600); err != nil {
+			os.Exit(1)
+		}
+		if index >= len(heads) {
+			index = len(heads) - 1
+		}
+		if heads[index] == "ERROR" {
+			fmt.Fprintln(os.Stderr, "head lookup failed")
+			os.Exit(1)
+		}
+		return heads[index]
+	}
+
 	configured := os.Getenv("FAKE_CLI_PR_HEAD_SHA")
 	if os.Getenv("FAKE_CLI_HEAD_FROM_WORKTREE") != "1" || configured != "deadbeef" {
 		return configured
@@ -493,6 +649,34 @@ func fakeGitForward(args []string, realGit string) {
 	os.Exit(0)
 }
 
+func fakeAzureEmptyPRHandler(args []string) {
+	if len(args) >= 2 && ((args[0] == "extension" && args[1] == "show") || (args[0] == "devops" && args[1] == "project")) {
+		os.Exit(0)
+	}
+	if len(args) >= 3 && args[0] == "repos" && args[1] == "pr" {
+		switch args[2] {
+		case "list":
+			fmt.Println("[]")
+			os.Exit(0)
+		case "create":
+			file, ok := fakeCLIFlagValue(args, "--description")
+			if !ok || !strings.HasPrefix(file, "@") {
+				os.Exit(1)
+			}
+			body, err := os.ReadFile(strings.TrimPrefix(file, "@"))
+			if err != nil {
+				os.Exit(1)
+			}
+			if err := os.WriteFile(os.Getenv("FAKE_CLI_PR_BODY_FILE"), body, 0o600); err != nil {
+				os.Exit(1)
+			}
+			fmt.Println(`{"pullRequestId":0}`)
+			os.Exit(0)
+		}
+	}
+	os.Exit(1)
+}
+
 func fakeGlabHandler(args []string) {
 	mrViewJSON := os.Getenv("FAKE_CLI_MR_VIEW_JSON")
 	if len(args) >= 2 && args[0] == "auth" && args[1] == "status" {
@@ -507,6 +691,10 @@ func fakeGlabHandler(args []string) {
 		os.Exit(0)
 	}
 	if len(args) >= 2 && args[0] == "mr" && args[1] == "view" {
+		if raw, ok := os.LookupEnv("FAKE_CLI_MR_READBACK_JSON"); ok {
+			fmt.Println(raw)
+			os.Exit(0)
+		}
 		if mrViewJSON != "" {
 			fmt.Println(mrViewJSON)
 			os.Exit(0)
@@ -523,6 +711,10 @@ func fakeGlabHandler(args []string) {
 	}
 	if len(args) >= 2 && args[0] == "mr" && args[1] == "create" {
 		fakeGlabRecordMR(args, 99)
+		if raw, ok := os.LookupEnv("FAKE_CLI_MR_CREATE_OUTPUT"); ok {
+			fmt.Println(raw)
+			os.Exit(0)
+		}
 		fmt.Println("https://gitlab.com/test/repo/-/merge_requests/99")
 		os.Exit(0)
 	}
@@ -605,6 +797,10 @@ func extractTrailingNumber(rawURL string) int {
 
 func fakeCIGHReconcileHandler(args []string) {
 	joined := strings.Join(args, " ")
+	if len(args) > 0 && args[0] == "api" && !strings.Contains(joined, "graphql") {
+		fakeGHHandler(args)
+		return
+	}
 	if len(args) >= 2 && args[0] == "auth" && args[1] == "status" {
 		os.Exit(0)
 	}
@@ -774,6 +970,15 @@ func fakeCIGHHandler(args []string) {
 		fmt.Println(checksJSON)
 		os.Exit(0)
 	}
+	if strings.Contains(joined, "api") && strings.Contains(joined, "/check-runs") {
+		if payload := os.Getenv("FAKE_CLI_EXTERNAL_REVIEWS"); payload != "" {
+			fmt.Println(payload)
+			os.Exit(0)
+		}
+		fmt.Fprintln(os.Stderr, "unexpected external review read")
+		os.Exit(1)
+	}
+
 	if strings.Contains(joined, "api") && strings.Contains(joined, "graphql") {
 		if strings.Contains(joined, "reviewThreads") {
 			printFakeReviewThreads(os.Getenv("FAKE_CLI_REVIEW_COMMENTS"))
@@ -1299,6 +1504,7 @@ func printFakeWorkflowRuns() {
 
 func printFakeCommitChecks(raw string, args []string) {
 	var checks []struct {
+		ID          int64  `json:"id"`
 		Name        string `json:"name"`
 		State       string `json:"state"`
 		Status      string `json:"status"`
@@ -1308,7 +1514,8 @@ func printFakeCommitChecks(raw string, args []string) {
 		Link        string `json:"link"`
 		// App is the check suite's app slug, rendered the way GitHub's
 		// GraphQL rollup reports it (checkSuite.app.slug). Empty omits it.
-		App string `json:"app"`
+		App   string `json:"app"`
+		AppID int64  `json:"app_id"`
 	}
 	if err := json.Unmarshal([]byte(raw), &checks); err != nil {
 		fmt.Println(raw)
@@ -1345,11 +1552,11 @@ func printFakeCommitChecks(raw string, args []string) {
 			link = strings.Replace(link, "github.com/test/repo/", "github.com/"+repo+"/", 1)
 		}
 		node := map[string]any{
-			"__typename": "CheckRun", "name": check.Name, "status": status,
+			"__typename": "CheckRun", "databaseId": check.ID, "name": check.Name, "status": status,
 			"conclusion": conclusion, "completedAt": check.CompletedAt, "detailsUrl": link,
 		}
 		if check.App != "" {
-			node["checkSuite"] = map[string]any{"app": map[string]any{"slug": check.App}}
+			node["checkSuite"] = map[string]any{"app": map[string]any{"slug": check.App, "databaseId": check.AppID}}
 		}
 		nodes = append(nodes, node)
 	}
@@ -1381,10 +1588,11 @@ func printFakeCommitChecks(raw string, args []string) {
 // comment. An empty or invalid value renders a pull request with no threads.
 func printFakeReviewThreads(raw string) {
 	var comments []struct {
-		Author string `json:"author"`
-		Path   string `json:"path"`
-		Line   int    `json:"line"`
-		Body   string `json:"body"`
+		Author   string `json:"author"`
+		AuthorID int64  `json:"author_id"`
+		Path     string `json:"path"`
+		Line     int    `json:"line"`
+		Body     string `json:"body"`
 	}
 	if raw != "" {
 		if err := json.Unmarshal([]byte(raw), &comments); err != nil {
@@ -1404,7 +1612,7 @@ func printFakeReviewThreads(raw string) {
 					"line":       comment.Line,
 					"url":        fmt.Sprintf("https://github.com/test/repo/pull/42#discussion_r%d", i+1),
 					"createdAt":  "2026-09-07T00:00:00Z",
-					"author":     map[string]any{"login": comment.Author},
+					"author":     map[string]any{"login": comment.Author, "databaseId": comment.AuthorID},
 				}},
 			},
 		})

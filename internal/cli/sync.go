@@ -275,7 +275,11 @@ func runHumanRecover(cmd *cobra.Command, keepLocal, yes bool) error {
 		}
 		if keepLocal {
 			fmt.Fprintln(cmd.OutOrStdout(), "  Recovery returns custody of this branch from its terminal run. The only")
-			if state.Recovery != nil && state.Recovery.KeepLocal {
+			if state.Recovery != nil && state.Recovery.KeepLocal && state.Recovery.Source == "pinned_head" {
+				fmt.Fprintln(cmd.OutOrStdout(), "  possible Git change is moving the local gate branch to the exact required")
+				fmt.Fprintln(cmd.OutOrStdout(), "  head; the worktree is never touched and the pipeline commits stay at the")
+				fmt.Fprintln(cmd.OutOrStdout(), "  recovery ref.")
+			} else if state.Recovery != nil && state.Recovery.KeepLocal {
 				fmt.Fprintln(cmd.OutOrStdout(), "  possible Git change is moving the local gate branch to the exact required")
 				fmt.Fprintln(cmd.OutOrStdout(), "  head; the worktree and verified divergent archive are never touched.")
 			} else {
@@ -407,6 +411,9 @@ func humanSyncSummary(state branchsync.State) string {
 	switch state.State {
 	case branchsync.StatePipelineOwned:
 		if state.Safety == "blocked_pipeline_owned_recoverable" {
+			if state.Recovery != nil && state.Recovery.KeepLocal && state.Recovery.Source == "pinned_head" {
+				return "pipeline commits stay at the recovery ref and are not on the branch; recover custody at the current local head with `no-mistakes sync --recover --keep-local`"
+			}
 			if state.Recovery != nil && state.Recovery.KeepLocal {
 				return "later pipeline work is preserved by a verified archive; recover custody at the exact required head with `no-mistakes sync --recover --keep-local`"
 			}
@@ -666,11 +673,20 @@ func branchSyncField(state branchsync.State) toON.Field {
 }
 
 func cachedBranchSyncField(ctxCmd *cobra.Command, runID string) *toON.Field {
-	service, closeFn, err := openSyncService()
+	// Cached annotations must not initialize or migrate the database.
+	env, err := openAxiQueryEnv("")
 	if err != nil {
 		return nil
 	}
-	defer closeFn()
+	defer env.close()
+	if env.globalConfigErr != nil {
+		return nil
+	}
+	service := &branchsync.Service{
+		DB: env.d, Repo: env.repo, WorkDir: ".",
+		GateDir: env.p.RepoDir(env.repo.ID), Paths: env.p,
+		RemoteTimeout: env.cfg.BranchSyncRemoteTimeout,
+	}
 	state := service.InspectCached(ctxCmd.Context())
 	if runID != "" && state.Pipeline.RunID != runID {
 		return nil

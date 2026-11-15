@@ -1,8 +1,11 @@
 package steps
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
@@ -291,6 +294,19 @@ func (s *CIStep) lastRepairStillUnverified(checks []scm.Check, mergeConflict boo
 	return true
 }
 
+// checkTargetStillFailing reports whether a check matching target is in the
+// fail bucket. Unlike checkTargetFailedTerminally it does not accept a
+// cancelled check: the pre-repair refresh must only hand the fixer a failure
+// the provider still reports, never a cancellation of a re-run.
+func checkTargetStillFailing(checks []scm.Check, target scm.CheckTarget) bool {
+	for _, check := range checks {
+		if checkMatchesTarget(check, target) && check.Failing() {
+			return true
+		}
+	}
+	return false
+}
+
 func checkTargetFailedTerminally(checks []scm.Check, target scm.CheckTarget) bool {
 	for _, check := range checks {
 		if checkMatchesTarget(check, target) && checkFailedTerminally(check) {
@@ -373,12 +389,25 @@ func terminalCheckTargetsForNames(checks []scm.Check, names []string) []scm.Chec
 	return targets
 }
 
+// ghChecksJSONUnsupported reports whether err looks like gh rejecting the
+// `--json` flag of `pr checks`, which is what a gh older than 2.50 does. Any
+// other check-read failure (auth, network, a missing PR, a parse failure) says
+// nothing about the gh version, so it must not be blamed on it.
+func ghChecksJSONUnsupported(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "gh pr checks:") && strings.Contains(msg, "unknown flag: --json")
+}
+
 func ciCheckReadFailureOutcome(err error) *pipeline.StepOutcome {
+	desc := fmt.Sprintf("CI checks could not be read from the provider: %v. Verify that the provider CLI or credentials are installed, authenticated, and support the required check-reading command.", err)
+	if ghChecksJSONUnsupported(err) {
+		desc += " The GitHub CLI rejected 'pr checks --json'; gh >= 2.50 is required."
+	}
 	findings := Findings{
 		Summary: "CI checks could not be read from the provider",
 		Items: []Finding{{
 			Severity:    "warning",
-			Description: fmt.Sprintf("CI checks could not be read from the provider: %v. Verify that the provider CLI or credentials are installed, authenticated, and support the required check-reading command. For GitHub errors involving 'pr checks --json', gh >= 2.50 is required.", err),
+			Description: desc,
 			Action:      types.ActionAskUser,
 		}},
 	}
@@ -460,4 +489,16 @@ func ciMonitoringTimeoutOutcome() *pipeline.StepOutcome {
 		NeedsApproval: true,
 		Findings:      string(findingsJSON),
 	}
+}
+
+func getCIChecks(ctx context.Context, host scm.Host, pr *scm.PR) ([]scm.Check, string, bool, error) {
+	requestedHead := pr.HeadSHA
+	pr.ObservedHeadSHA = ""
+	checks, err := host.GetChecks(ctx, pr)
+	observedHead := pr.ObservedHeadSHA
+	moved := errors.Is(err, scm.ErrHeadChanged) || observedHead != "" && observedHead != requestedHead
+	if moved && err != nil && !pluginContractBroken(err) {
+		err = fmt.Errorf("%w: %v", scm.ErrHeadChanged, err)
+	}
+	return checks, observedHead, moved, err
 }

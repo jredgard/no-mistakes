@@ -47,7 +47,7 @@ Canonical Forgejo web base URL used for provider discovery and forgejo-axi comma
 | Type    | `URL`    |
 | Default | (none)   |
 
-Set this for every SSH origin, because an SSH remote does not identify the canonical Forgejo web scheme, port, or path prefix. Also set it when an HTTPS origin uses a self-hosted hostname other than `codeberg.org` or one containing `forgejo`. Recognized HTTPS origins are detected automatically, including non-default ports and path prefixes inferred from the origin. When set, the host and prefix must match the repository's upstream origin - name the clone hostname with [`FORGEJO_SSH_DOMAIN`](#forgejo_ssh_domain) when the instance serves SSH from a different host; credentials, query strings, and fragments are rejected.
+Set this when the run's [integration remote](/no-mistakes/reference/cli/#other-run-options) uses SSH, because an SSH remote does not identify the canonical Forgejo web scheme, port, or path prefix. Also set it when an HTTPS integration remote uses a self-hosted hostname other than `codeberg.org` or one containing `forgejo`. Recognized HTTPS remotes are detected automatically, including non-default ports and path prefixes inferred from their URLs. When set, the host and prefix must match the integration repository's URL. Name the clone hostname with [`FORGEJO_SSH_DOMAIN`](#forgejo_ssh_domain) when the instance serves SSH from a different host; credentials, query strings, and fragments are rejected.
 
 ## `FORGEJO_SSH_DOMAIN`
 
@@ -58,13 +58,13 @@ Hostname a Forgejo instance publishes in SSH clone URLs when it differs from the
 | Type    | `string` |
 | Default | (none)   |
 
-Set this to the instance's own `SSH_DOMAIN` value when Forgejo serves SSH from a hostname other than its web host, so an origin such as `git@ssh.forgejo.example:octo/widgets.git` is still recognized as that instance.
+Set this to the instance's own `SSH_DOMAIN` value when Forgejo serves SSH from a hostname other than its web host, so an integration remote such as `git@ssh.forgejo.example:octo/widgets.git` is still recognized as that instance.
 
-Give a bare ASCII hostname or IP address, with an optional port that is ignored, because an instance's SSH clone port varies independently of its hostname. Hostname labels hold letters, digits, hyphens, and underscores, with a hyphen or underscore never first or last in a label, and an IPv6 address is bracketed (`[2001:db8::1]`). Any other value is treated as unset: a scheme, path, credentials, query string, or fragment, and also a name that could never match an origin, such as a wildcard or a trailing dot. no-mistakes never echoes a rejected value back into a log or an error, because the setting can hold a pasted credential.
+Give a bare ASCII hostname or IP address, with an optional port that is ignored, because an instance's SSH clone port varies independently of its hostname. Hostname labels hold letters, digits, hyphens, and underscores, with a hyphen or underscore never first or last in a label, and an IPv6 address is bracketed (`[2001:db8::1]`). Any other value is treated as unset: a scheme, path, credentials, query string, or fragment, and also a name that could never match a remote hostname, such as a wildcard or a trailing dot. no-mistakes never echoes a rejected value back into a log or an error, because the setting can hold a pasted credential.
 
-The variable only widens which SSH origins belong to the instance `FORGEJO_BASE_URL` already names, so it does nothing while that variable is unset or invalid. The upstream path prefix must still match, and HTTPS origins are unaffected. GitHub, GitLab, Bitbucket, and Azure DevOps hosts, plus any host configured in `glab`, `gh`, or `tea`, are all matched before the declared domain; against the remaining hostname guesses, the declared domain carries exactly the weight a `FORGEJO_BASE_URL` match already carries.
+The variable only widens which SSH remotes belong to the instance `FORGEJO_BASE_URL` already names, so it does nothing while that variable is unset or invalid. The upstream path prefix must still match, and HTTPS remotes are unaffected. GitHub, GitLab, Bitbucket, and Azure DevOps hosts, plus any host configured in `glab`, `gh`, or `tea`, are all matched before the declared domain; against the remaining hostname guesses, the declared domain carries exactly the weight a `FORGEJO_BASE_URL` match already carries.
 
-If you worked around a split host by adding a `tea` login for it, delete that login when you set this variable. Because tea's configured hosts are matched first, a login whose `url` host or `ssh_host` equals the origin's host keeps the repository on the Gitea provider: the PR and CI steps keep running through `tea` instead of forgejo-axi, and where `tea` is not installed or not logged in, the PR step is skipped. Find the login with `tea logins list` and remove it with `tea logins delete <name>` (on tea 1.0: `tea auth status` and `tea auth logout --host <url>`).
+If you worked around a split host by adding a `tea` login for it, delete that login when you set this variable. Because tea's configured hosts are matched first, a login whose `url` host or `ssh_host` equals the integration remote's host keeps the repository on the Gitea provider: the PR and CI steps keep running through `tea` instead of forgejo-axi, and where `tea` is not installed or not logged in, the PR step is skipped. Find the login with `tea logins list` and remove it with `tea logins delete <name>` (on tea 1.0: `tea auth status` and `tea auth logout --host <url>`).
 
 ## `FORGEJO_TOKEN_<HOST_KEY>`
 
@@ -196,6 +196,32 @@ Disable background update checks.
 
 Update checks run on every CLI invocation except `update` itself and version queries (`--version` / `-v`, which stay side-effect-free), fetch the GitHub release-asset channel manifest, cache the result in `$NM_HOME/update-check.json`, and print a one-line notification to stderr when a newer version is available. Dev builds (non-semver versions) and binaries that resolve into `/nix/store` suppress the check automatically.
 
+## `CLAUDE_CONFIG_DIR`
+
+Claude Code account directory used for intent transcript discovery.
+
+|         |             |
+| ------- | ----------- |
+| Type    | `string`    |
+| Default | `~/.claude` |
+
+no-mistakes reads Claude Code transcripts from `$CLAUDE_CONFIG_DIR/projects`.
+
+For both `CLAUDE_CONFIG_DIR` and [`CODEX_HOME`](#codex_home), CLI launches, push-hook notifications, and TUI reruns capture the caller's values, using the caller's home directory for defaults when a variable is unset or empty. The selected roots are stored with the run and survive daemon recovery, independently of the daemon's environment. A rerun captures the current caller's selection. A retry continuation retains the failed run's selection. Historical runs without recorded roots retain default-path discovery.
+
+Each selected root must be an absolute path. Relative paths, literal unexpanded `~` paths, and unresolved defaults disable only that provider's discovery and log the rejection in the Intent step. They do not prevent the run from starting or disable discovery for the other provider. Missing or unreadable selected homes never fall back to another account. These settings select transcripts and do not change pipeline-agent authentication.
+
+## `CODEX_HOME`
+
+Codex account directory used for intent transcript discovery.
+
+|         |            |
+| ------- | ---------- |
+| Type    | `string`   |
+| Default | `~/.codex` |
+
+no-mistakes reads Codex metadata from `$CODEX_HOME/state_*.sqlite` and transcripts from the referenced rollout files. Relative rollout paths resolve against the selected Codex home. The [caller-selection, persistence, and failure rules](#claude_config_dir) also apply to this variable.
+
 ## `XDG_DATA_HOME`
 
 Data directory used to discover OpenCode transcripts for intent extraction.
@@ -228,7 +254,7 @@ Directory holding gh's `hosts.yml`, consulted when detecting self-hosted GitHub 
 | Type    | `string` |
 | Default | (none)   |
 
-When the upstream hostname is not `github.com`, no-mistakes reads gh's configured hosts from `$GH_CONFIG_DIR/hosts.yml` to decide whether the host is a GitHub Enterprise instance. It takes precedence over `XDG_CONFIG_HOME`. A selected [`forge_profiles`](/no-mistakes/reference/global-config/#forge_profiles) entry overrides this variable for that run and removes `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`, and `GH_REPO` from all child processes. See [Provider Integration](/no-mistakes/guides/provider-integration/#self-hosted-githubgitlab).
+When the upstream hostname is not `github.com`, no-mistakes reads gh's configured hosts from `$GH_CONFIG_DIR/hosts.yml` to decide whether the host is a GitHub Enterprise instance. It takes precedence over `XDG_CONFIG_HOME`. A selected [`forge_profiles`](/no-mistakes/reference/global-config/#forge_profiles) entry overrides this variable for that run (a `gh_user` profile leaves it as is) and removes `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`, and `GH_REPO` from all child processes; a `gh_user` profile then sets `GH_TOKEN` (or `GH_ENTERPRISE_TOKEN` on a GitHub Enterprise Server host) to the selected login's token for that run. See [Provider Integration](/no-mistakes/guides/provider-integration/#self-hosted-githubgitlab).
 
 ## `TEA_CONFIG_DIR`
 
@@ -287,11 +313,11 @@ Override or enable the telemetry website ID.
 
 When set, telemetry uses this website ID at runtime. If it is unset in a dev build, `no-mistakes` also checks a repo-local `.env` file for `NO_MISTAKES_UMAMI_WEBSITE_ID`. If no runtime value is found, it falls back to any website ID embedded at build time.
 
-When telemetry is enabled, `no-mistakes` sends command, run, approval, fix, and wizard events, completed step events with `awaiting_approval`, `fix_review`, or `failed` status, and pageviews for the human surfaces `/wizard` and `/tui` and the state-changing agent surfaces `/axi/run`, `/axi/respond`, `/axi/abort`, and `/axi/retry` to Umami.
+When telemetry is enabled, `no-mistakes` sends command, run, approval, fix, and wizard events, completed step events with `awaiting_approval`, `fix_review`, or `failed` status, and pageviews for the human surfaces `/wizard` and `/tui` and the state-changing agent surfaces `/axi/run`, `/axi/respond`, `/axi/abort`, `/axi/retry`, and `/axi/handoff` to Umami.
 Mutation pageviews are sent alongside command events, so command status and duration remain available.
 They include only flag-derived context: `/axi/run` records booleans such as whether `--yes` or `--skip` was supplied and whether explicit intent was supplied through any [intent input transport](/no-mistakes/reference/cli/#intent-input); `/axi/respond` records the sanitized action and whether `--yes` was present. The intent boolean does not distinguish text, file, and stdin input, and intent input rejected by the CLI resolver emits no `axi-run` command event or pageview.
 
-Read-only surfaces (`axi` home, `axi status`, `axi logs`, `status`, `runs`) emit no telemetry at all, so agent status polling cannot flood remote analytics. Mutation surfaces (`axi run`, `axi respond`, `axi abort`, `axi retry`, run lifecycle, approvals, and fixes) stay full-fidelity.
+Read-only surfaces (`axi` home, `axi status`, `axi logs`, `axi rounds`, `status`, `runs`, `export`) emit no telemetry at all, so agent status polling cannot flood remote analytics. Mutation surfaces (`axi run`, `axi respond`, `axi abort`, `axi retry`, `axi handoff`, run lifecycle, approvals, and fixes) stay full-fidelity.
 Each explicit human CLI, AXI, or TUI branch-sync check/apply attempt emits one command event and no additional pageview.
 Its fields are bounded enums and booleans only: surface, mode, state, relation, target kind, pipeline phase, PR state, result, refusal reason, dirty state, and duration.
 It never sends a SHA, run ID, path, branch name, URL, remote name, or command argument.
@@ -306,7 +332,8 @@ Repository-declared [gate](/no-mistakes/reference/repo-config/#gates) labels sta
 
 Detailed performance evidence stays on the machine in the local state database (`<NM_HOME>/state.sqlite`): one `agent_invocations` row per agent invocation, plus each run's accumulated parked-at-gate time.
 Each row records run and step identity, purpose (such as review/review-fix/housekeeping), the reported model and its provider, the cold/started/resumed/fallback session mode, a truncated session-identity hash, timestamps, duration, exit status, and failure category, alongside the session-fidelity metrics below.
-It never stores prompts, model outputs, diffs, raw command arguments, secret values, or credentials - only bounded counts, low-cardinality categories, and durations.
+For an explicit [reviewer fallback chain](/no-mistakes/reference/global-config/#review_agents), each attempt also records `configured_model` when nonempty, including any configured provider prefix. This identifies the configured candidate separately from the adapter-reported model and provider, including on failed attempts. Native argument overrides can still take precedence, so this field does not prove which model served the request. Older rows and attempts without this metadata read back as NULL.
+It never stores prompts, model outputs, diffs, raw command arguments, secret values, or credentials.
 
 Token counts and the additive session-fidelity fields are nullable and read back as unknown (rendered `-`) rather than a fabricated zero when the adapter did not report them, so a failed or cancelled invocation, a row written before a field existed, and an adapter that does not surface a datum stay honest.
 A recorded `0` means the adapter reported zero; it is distinct from unknown.
@@ -318,6 +345,7 @@ A recorded `0` means the adapter reported zero; it is distinct from unknown.
 
 The count and timing definitions live in one authoritative place (`internal/agent/invocationmetrics.go`).
 Inspect the evidence with `no-mistakes stats --agents` (per-purpose aggregates, including a `METRICS` coverage count so a real zero is distinguishable from missing instrumentation) or `no-mistakes stats --run <id>` (one run's invocations, the per-round-vs-cumulative token split, and parked time).
+For a versioned JSON snapshot of one run's stored delivery facts, use [`no-mistakes export --run <id> --json`](/no-mistakes/reference/cli/#no-mistakes-export).
 
 ## `NO_MISTAKES_TELEMETRY`
 
@@ -330,8 +358,18 @@ Disable telemetry collection.
 
 When set to a disabling value, telemetry stays off even if a runtime or embedded website ID is available.
 
+On macOS and Linux, set this variable before `no-mistakes init` to include it in the managed daemon's service definition. To change an existing installation, export the new value and run `no-mistakes daemon restart`. Service refreshes and binary upgrades preserve the stored value when the current shell has no nonempty value. To re-enable telemetry, explicitly set `NO_MISTAKES_TELEMETRY=1` and restart the daemon. Windows Task Scheduler inherits the user's logon environment, so set it there for the managed daemon.
+
+## Git commit environment
+
+Submission identity capture honors `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL` from the submitting process. The [pipeline commit identity policy](/no-mistakes/reference/pipeline-steps/) owns how that identity is bound to a run and preserved during correction rewriting.
+
+Pipeline-owned Git calls set those four variables to the run's saved identity and remove inherited `GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE`. New commit dates are not pinned. These calls retain inherited command-scope Git configuration, as do provider CLI and plugin calls.
+
+Agent and configured-command environments exclude inherited author and committer name, email and date variables, plus all command-scope Git configuration supplied through `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`, and `GIT_CONFIG_PARAMETERS`. Filtering happens after step, forge, and adapter overlays, so those overlays cannot restore the excluded variables. This removes non-identity command-scope settings too, such as proxy, credential-helper, and URL-rewrite settings. These subprocesses use normal Git repository and worktree configuration, where the run's identity is stored. Nested repositories retain their own configured identities.
+
 ## Environment the daemon sees
 
-When the daemon runs through a managed service (launchd, systemd user service, Task Scheduler), the macOS and Linux service definitions include a default `PATH` with common user and system binary directories. They also bake in any proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`) that were set when you installed or refreshed the service, so the daemon and the agents it spawns can reach the network through your proxy even when the login-shell probe is unavailable. Once baked in, the values are preserved across later service refreshes and restarts even when the proxy variables are not exported in that shell, so a routine `daemon restart` or a binary upgrade will not strip them; export the variables again only when you need to change or remove them. Both the upper- and lower-case spellings are forwarded exactly as you set them, because tooling is inconsistent about which it reads (curl, for example, honors only the lower-case `http_proxy` for plain-HTTP requests). Because a proxy URL can embed credentials (for example `http://user:pass@host`), the generated service file is restricted to owner-only `0600` permissions whenever proxy values are forwarded into it. When no proxy variables are set, the generated definition is unchanged and keeps the conventional `0644` mode. Windows Task Scheduler inherits your logon environment and needs no forwarding. At daemon startup, the daemon resolves environment once from your login shell on macOS and Linux (`$SHELL -l -i -c 'env -0'` for bash and zsh, run in its own session so an interactive shell never waits on a terminal), preserves your shell `PATH` order, and appends any missing well-known directories such as `~/.local/bin`, `~/go/bin`, `~/.cargo/bin`, `~/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, and `/bin`. When the login shell binary itself does not exist yet, which happens on macOS with nix-darwin when the daemon starts at login before `/run/current-system` has been recreated, startup waits for it with backoff for up to a minute before giving up. If login-shell resolution still fails or returns no entries, the daemon logs a warning and uses an augmented process-environment fallback that may omit version-manager directories such as nvm, fnm, or volta. Restart the daemon to pick up a login shell that appeared or changed after startup. On Windows it reuses the current process environment.
+When the daemon runs through a managed service (launchd, systemd user service, Task Scheduler), the macOS and Linux service definitions include a default `PATH` with common user and system binary directories. They also bake in any proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`) that were set when you installed or refreshed the service, so the daemon and the agents it spawns can reach the network through your proxy even when the login-shell probe is unavailable. Once baked in, the values are preserved across later service refreshes and restarts even when the proxy variables are not exported in that shell, so a routine `daemon restart` or a binary upgrade will not strip them; export the variables again only when you need to change or remove them. Both the upper- and lower-case spellings are forwarded exactly as you set them, because tooling is inconsistent about which it reads (curl, for example, honors only the lower-case `http_proxy` for plain-HTTP requests). Because a proxy URL can embed credentials (for example `http://user:pass@host`), the generated service file is restricted to owner-only `0600` permissions whenever proxy or telemetry values are forwarded into it. When neither is forwarded, the generated definition keeps the conventional `0644` mode. Windows Task Scheduler inherits your logon environment and needs no forwarding. At daemon startup, the daemon resolves environment once from your login shell on macOS and Linux (`$SHELL -l -i -c 'env -0'` for bash and zsh, run in its own session so an interactive shell never waits on a terminal), preserves your shell `PATH` order, and appends any missing well-known directories such as `~/.local/bin`, `~/go/bin`, `~/.cargo/bin`, `~/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, and `/bin`. When the login shell binary itself does not exist yet, which happens on macOS with nix-darwin when the daemon starts at login before `/run/current-system` has been recreated, startup waits for it with backoff for up to a minute before giving up. If login-shell resolution still fails or returns no entries, the daemon logs a warning and uses an augmented process-environment fallback that may omit version-manager directories such as nvm, fnm, or volta. Restart the daemon to pick up a login shell that appeared or changed after startup. On Windows it reuses the current process environment.
 
-If your env vars aren't set in your login shell's rc files (`.zprofile`, `.zshrc`, `.profile`, `.bash_profile`, `.bashrc`, PowerShell profile), the daemon won't see them. Put them somewhere a login shell will load, then restart the daemon to pick them up.
+For variables inherited by the daemon and its child processes, apart from the proxy variables and `NO_MISTAKES_TELEMETRY` forwarded on macOS and Linux, use the login shell's rc files (`.zprofile`, `.zshrc`, `.profile`, `.bash_profile`, `.bashrc`, PowerShell profile) or, on Windows, the logon environment. Put them somewhere the daemon will inherit or load, then restart it to pick them up. Caller-selected [transcript homes](#claude_config_dir) follow their own capture rules above.

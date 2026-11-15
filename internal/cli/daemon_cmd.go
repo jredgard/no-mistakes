@@ -7,23 +7,27 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/daemon"
 	"github.com/kunchenguid/no-mistakes/internal/gatecontext"
+	"github.com/kunchenguid/no-mistakes/internal/integration"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/lifecycle"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/runenv"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"github.com/spf13/cobra"
 )
 
 var (
-	daemonRun                  = daemon.Run
+	daemonRun                  = daemon.RunRestartable
 	daemonStartFn              = daemon.Start
 	daemonStartGuardedFn       = daemon.StartGuarded
 	daemonStopFn               = daemon.Stop
+	daemonScheduleRestartFn    = daemon.ScheduleRestart
 	daemonUninstallFn          = daemon.Uninstall
 	daemonUninstallSupportedFn = daemon.UninstallSupported
 	daemonLaunchAgentPathFn    = daemon.InstalledLaunchAgentPath
@@ -60,6 +64,26 @@ func newDaemonAdmitPushCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			var pushOptions []string
+			if rawCount := os.Getenv("GIT_PUSH_OPTION_COUNT"); rawCount != "" {
+				count, err := strconv.Atoi(rawCount)
+				// Every declared option needs an environment entry. This also
+				// bounds iteration by the actual environment, not an untrusted count.
+				if err != nil || count < 0 || count > len(os.Environ()) {
+					return fmt.Errorf("invalid git push option count")
+				}
+				for i := 0; i < count; i++ {
+					option, ok := os.LookupEnv(fmt.Sprintf("GIT_PUSH_OPTION_%d", i))
+					if !ok {
+						return fmt.Errorf("missing git push option")
+					}
+					pushOptions = append(pushOptions, option)
+				}
+			}
+			reviewer, err := parseReviewerPushOptions(pushOptions)
+			if err != nil {
+				return err
+			}
 			// Resolve the daemon root from the gate itself, not NM_HOME: this
 			// runs as a git hook helper, and git sets no NM_HOME for a hook.
 			p, err := paths.ForGate(gatePath)
@@ -72,10 +96,13 @@ func newDaemonAdmitPushCmd() *cobra.Command {
 			}
 			defer client.Close()
 			var result ipc.AdmitPushResult
-			if err := client.Call(ipc.MethodAdmitPush, &ipc.AdmitPushParams{Gate: gatePath}, &result); err != nil {
+			if err := client.Call(ipc.MethodAdmitPush, &ipc.AdmitPushParams{Gate: gatePath, ReviewerProfile: reviewer}, &result); err != nil {
 				return err
 			}
 			if !result.Context.Nested {
+				if reviewer != nil && !result.ReviewerValidated {
+					return fmt.Errorf("daemon does not validate reviewer admission; restart it before pushing a reviewer selection")
+				}
 				return nil
 			}
 			return emitGateContextRefusal(cmd, gatecontext.Result{
@@ -131,10 +158,18 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 				return err
 			}
 			omitIntent, err := parseOmitIntentPushOptions(pushOptions)
+			baseRemote, remoteErr := parseBaseRemotePushOptions(pushOptions)
+			if remoteErr != nil {
+				return remoteErr
+			}
 			if err != nil {
 				return err
 			}
 			piProfile, err := parsePiProfilePushOptions(pushOptions)
+			if err != nil {
+				return err
+			}
+			reviewer, err := parseReviewerPushOptions(pushOptions)
 			if err != nil {
 				return err
 			}
@@ -147,6 +182,10 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 				return err
 			}
 			closingIssues, err := parseClosingIssueRefsPushOptions(pushOptions)
+			if err != nil {
+				return err
+			}
+			prText, err := parsePRTextPushOptions(pushOptions)
 			if err != nil {
 				return err
 			}
@@ -168,8 +207,26 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 			}
 			defer client.Close()
 
+			if err := client.RequireTranscriptHomes(); err != nil {
+				return err
+			}
+			homes := runenv.CaptureTranscriptHomes()
+			identity, err := parseCommitIdentityPushOptions(pushOptions)
+			if err != nil {
+				return err
+			}
+			if identity == nil {
+				identity, err = captureHookIdentity(cmd.Context(), client, p, gatePath)
+				if err != nil {
+					return err
+				}
+			} else if err := client.RequireCommitIdentity(); err != nil {
+				return err
+			}
 			var result ipc.PushReceivedResult
 			return client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+				CommitIdentity:         identity,
+				TranscriptHomes:        homes,
 				Gate:                   gatePath,
 				Ref:                    ref,
 				Old:                    oldSHA,
@@ -179,11 +236,15 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 				LaunchNonce:            launchNonce,
 				ValidationGeneration:   validationGeneration,
 				PRBaseBranch:           prBaseBranch,
+				BaseRemote:             baseRemote,
 				OmitIntent:             omitIntent,
 				PiProfile:              piProfile,
+				ReviewerProfile:        reviewer,
 				VerificationPlanID:     verificationPlanID,
 				ReconciledPreviousHead: reconciledPreviousHead,
 				ClosingIssueRefs:       closingIssues,
+				PRTitle:                prText.Title,
+				PRBody:                 prText.Body,
 			}, &result)
 		},
 	}
@@ -300,6 +361,26 @@ func parseOpaquePushOptions(options []string, prefix, label string) (string, err
 
 // prBaseBranchPushOptionPrefix carries a per-run PR base branch through a git push.
 const prBaseBranchPushOptionPrefix = "no-mistakes.pr-base-branch="
+
+const baseRemotePushOptionPrefix = "no-mistakes.base-remote="
+
+func parseBaseRemotePushOptions(options []string) (string, error) {
+	remote := ""
+	for _, option := range options {
+		value, ok := strings.CutPrefix(option, baseRemotePushOptionPrefix)
+		if !ok {
+			continue
+		}
+		if err := integration.ValidateRemote(value); err != nil {
+			return "", err
+		}
+		if remote != "" && remote != value {
+			return "", fmt.Errorf("conflicting base remote push options")
+		}
+		remote = value
+	}
+	return remote, nil
+}
 
 // formatIntentPushOption encodes intent as a single push option, or returns ""
 // when there is no intent to carry.
@@ -646,7 +727,7 @@ func newDaemonUninstallCmd() *cobra.Command {
 }
 
 func newDaemonRestartCmd() *cobra.Command {
-	var force bool
+	var force, whenIdle bool
 	cmd := &cobra.Command{
 		Use:   "restart",
 		Short: "Restart the daemon (stop if running, then start)",
@@ -663,6 +744,20 @@ func newDaemonRestartCmd() *cobra.Command {
 				if err := p.EnsureDirs(); err != nil {
 					return err
 				}
+				if whenIdle && !force {
+					alive, err := daemonIsRunningFn(p)
+					if err != nil {
+						return err
+					}
+					if alive {
+						status, err := daemonScheduleRestartFn(p)
+						if err != nil {
+							return err
+						}
+						fmt.Fprintf(cmd.OutOrStdout(), "  %s %s\n", sGreen.Render("✓"), daemon.DescribeScheduledRestart(status))
+						return nil
+					}
+				}
 				if err := guardDestructiveDaemonLifecycle(p, cmd.ErrOrStderr(), "daemon restart", force); err != nil {
 					return err
 				}
@@ -678,6 +773,7 @@ func newDaemonRestartCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "restart the daemon even when pipeline runs are active")
+	cmd.Flags().BoolVar(&whenIdle, "when-idle", false, "let executing runs finish first, holding new pushes, then restart through the executable file")
 	return cmd
 }
 
@@ -720,6 +816,9 @@ func newDaemonStatusCmd() *cobra.Command {
 						fmt.Fprintf(cmd.OutOrStdout(), "  %s daemon running %s\n", sGreen.Render("●"), sDim.Render(fmt.Sprintf("(pid %d)", pid)))
 					} else {
 						fmt.Fprintf(cmd.OutOrStdout(), "  %s daemon running\n", sGreen.Render("●"))
+					}
+					if status, err := daemon.RestartStatus(p); err == nil && status.Pending {
+						fmt.Fprintf(cmd.OutOrStdout(), "  %s %s\n", sDim.Render("↻"), daemon.DescribePendingRestart(status))
 					}
 				} else {
 					fmt.Fprintf(cmd.OutOrStdout(), "  %s daemon not running\n", sDim.Render("○"))

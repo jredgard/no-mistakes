@@ -12,7 +12,7 @@ import (
 func TestPRStep_ACarriedStepReportsTheRoundsOfTheRunItWasCarriedFrom(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
-	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx := newPRTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
 
 	failed, err := sctx.DB.InsertRun(sctx.Repo.ID, sctx.Run.Branch, headSHA, baseSHA)
 	if err != nil {
@@ -41,11 +41,11 @@ func TestPRStep_ACarriedStepReportsTheRoundsOfTheRunItWasCarriedFrom(t *testing.
 		t.Fatal(err)
 	}
 
-	plainMD, _, _ := (&PRStep{}).buildPipelineSection(sctx, scm.ProviderGitHub)
+	plainMD, _, _, _ := (&PRStep{}).buildPipelineSection(sctx, scm.ProviderGitHub)
 	if !strings.Contains(plainMD, "review - 1 issue found → auto-fixed ✅") {
 		t.Fatalf("plain pipeline row does not report the carried review's finding and fix:\n%s", plainMD)
 	}
-	pipelineMD, _, _ := (&PRStep{}).buildPipelineSectionFor(sctx, scm.ProviderGitHub, true)
+	pipelineMD, _, _, _ := (&PRStep{}).buildPipelineSectionFor(sctx, scm.ProviderGitHub, true)
 	if !strings.Contains(pipelineMD, "the handler dereferences a nil config") || !strings.Contains(pipelineMD, "**Review**") {
 		t.Fatalf("pipeline section does not report the carried review's finding and fix:\n%s", pipelineMD)
 	}

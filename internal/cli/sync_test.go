@@ -1559,12 +1559,16 @@ func TestSyncRecoverFlagValidation(t *testing.T) {
 		{"sync", "--check", "--adopt-published"},
 		{"sync", "--recover", "--adopt-published"},
 		{"sync", "--keep-local"},
+		{"sync", "--take-pipeline"},
+		{"sync", "--recover", "--keep-local", "--take-pipeline"},
 		{"sync", "--bind-archive-ref", "refs/heads/archive/test", "--recover"},
 		{"sync", "--bind-archive-ref", "refs/heads/archive/test", "--yes"},
 		{"axi", "sync", "--check", "--recover"},
 		{"axi", "sync", "--check", "--adopt-published"},
 		{"axi", "sync", "--recover", "--adopt-published"},
 		{"axi", "sync", "--keep-local"},
+		{"axi", "sync", "--take-pipeline"},
+		{"axi", "sync", "--recover", "--keep-local", "--take-pipeline"},
 		{"axi", "sync", "--bind-archive-ref", "refs/heads/archive/test", "--check"},
 	} {
 		out, err := executeCmd(args...)

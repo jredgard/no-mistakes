@@ -519,6 +519,7 @@ no-mistakes axi sync --check
 no-mistakes axi sync
 no-mistakes axi sync --recover
 no-mistakes axi sync --recover --keep-local
+no-mistakes axi sync --recover --take-pipeline
 no-mistakes axi sync --bind-archive-ref refs/heads/archive/<name>
 no-mistakes axi sync --adopt-published
 ```
@@ -528,6 +529,7 @@ no-mistakes axi sync --adopt-published
 | `--check`            | `bool`   | `false` | Verify the live target and exact plan without changing `HEAD`                |
 | `--recover`          | `bool`   | `false` | Return custody of a branch stranded by a terminal run with unpublished pipeline commits (a no-op when cancellation already released the branch), or perform `recover_remote_rewritten` |
 | `--keep-local`       | `bool`   | `false` | With `--recover`: keep the current local head; never touches the worktree   |
+| `--take-pipeline`    | `bool`   | `false` | With `--recover`: take the pinned pipeline head after a recorded replay conflict |
 | `--bind-archive-ref` | `string` | (none)  | Bind one existing `refs/heads/archive/*` commit as exact evidence for a keep-local recovery; never creates or moves a Git ref |
 | `--adopt-published`  | `bool`   | `false` | Adopt a clean diverged local head into its stale gate lane only when the configured push target has that exact head |
 
@@ -567,13 +569,15 @@ A cancelled published run also offers `recover_custody` when its clean local bra
 For equal or ahead worktrees where the preserved head is already locally reachable, recovery writes that anchor locally without requiring gate access. If the gate is available, an existing symbolic, non-commit, or mismatched recovery ref is conflicting evidence and recovery refuses without overwriting it.
 For behind or diverged worktrees, recovery verifies the preserved head at the run-specific recovery ref in the local gate and fetches it into the anchor before moving or refusing. Legacy recorded heads that remain available as unreferenced gate objects are anchored before recovery continues.
 A clean behind worktree fast-forwards.
-A diverged worktree is adopted only when the preserved head provably carries every local change, proven by an executable three-way merge whose result is exactly the preserved head's tree.
+Plain recovery of a diverged worktree requires a three-way merge proving the target already contains every local change. The proof can also use a recorded Review start from the same run. Git must show that the Review start contains the current local head's changes and that the start is an ancestor of the preserved head. This covers a clean rebase followed by fixes that edited the same lines. Ordinary sync can use the same Review start proof for the verified published head.
 When the local head exists only in the worktree and the preserved head only in the gate, status proves the relationship without importing anything (the objects are read through a throwaway union of the two object stores) and offers plain `--recover` only when recovery will succeed. If instead the local head already carries every change the preserved head made (the same three-way merge with the roles swapped), recovery anchors the preserved head, leaves the branch and worktree where they are, and returns custody at the local head; the preserved commits stay reachable at `refs/no-mistakes/recover/<run>`. A genuinely divergent pair, unrelated histories, a dirty worktree, or a conflicting recovery ref still refuse and keep both copies.
 This covers a pipeline rebase onto a newer base without requiring the gate branch to advance to the preserved head.
 Terminalization pins a verified unpublished pipeline head under a run-specific recovery ref, so recovery does not require the gate branch itself to have advanced. If the verified recorded head is absent from both the worktree and an accessible gate and the recovery refs are compatible, status still offers `recover_custody`, but the command is `--recover --keep-local` rather than taking that head. Plain `--recover` without `--keep-local` still refuses.
-That adoption anchors the pre-recovery local head under `refs/no-mistakes/recover-local/<run>`, then moves the branch with Git operations that refuse on their own rather than after a preceding check: an atomic compare-and-swap on the branch ref, and a working-tree update that aborts instead of overwriting a modified or untracked file.
+Diverged adoption pins the pre-recovery local head under `refs/no-mistakes/recover-local/<run>` and the old mirror head under `refs/no-mistakes/recover-gate/<run>` when the respective branches move. Each branch ref advances by compare-and-swap. The worktree update refuses to overwrite a modified or untracked file. Recovery leaves the published ref untouched.
 The proof is deliberately narrow and never uses patch identity, which discards hunk locations and whitespace and so cannot tell a genuine replay from a same-shaped edit elsewhere.
-Anything it cannot decide - unlanded local commits, or a rebase whose fix rounds also rewrote your own lines - still refuses plain `--recover` with the anchor named, because only escalation can tell a deliberate pipeline fix apart from a dropped change. When the worktree is clean and that verified head is already pinned at `refs/no-mistakes/recover/<run>` in an accessible gate, status offers `no-mistakes axi sync --recover --keep-local`. The branch stays where it is. The pipeline commits stay at that ref and are not on the branch. An unverified terminal head is not offered that keep-local command.
+Plain `--recover` refuses if the proof cannot account for local work or if a squash dropped work and removed the recorded Review start from the target's ancestry. When the worktree is clean and the verified head is already pinned in the gate, status can offer `--recover --keep-local` to retain the current branch and keep the pipeline commits at the recovery ref.
+
+For a conflict at a recorded replay boundary, status also offers `branch_sync.take_pipeline.command` and names the unresolved paths in `branch_sync.replay_conflicts`. Run `no-mistakes axi sync --recover --take-pipeline` to adopt the pinned pipeline versions of those paths. This choice requires the original pin for the terminal head, a clean worktree, and local `HEAD` exactly at the run's submitted or last pushed commit. It is mutually exclusive with `--keep-local`.
 A dirty worktree refuses with explicit choices.
 When you explicitly keep a behind or diverged local head instead of taking the preserved head, `--keep-local` returns custody at the current head without touching the worktree and atomically points the gate branch at it. `--keep-local` is also the recovery when an accessible gate confirms that the verified recorded head is missing and the recovery refs are compatible: the operator is keeping the current local head and discarding those unpublished commits, so that missing object does not block the path. One `--keep-local` call releases the full stranded stack: genuinely missing heads are explicitly discarded, while still-available heads are anchored under their run-specific recovery refs first. Unverified or conflicting evidence on any run blocks the release before any custody stamp. If the gate branch moved independently, recovery first preserves that head under `refs/no-mistakes/recover-gate/<run>`; a conflicting pre-existing anchor makes recovery refuse, and a concurrent gate push wins the compare-and-swap and also makes recovery refuse.
 
@@ -584,7 +588,7 @@ Status uses the same `recoverySourceAvailable` classification as recovery and ac
 A verified archive plan reports its evidence in `branch_sync.recovery`, keeps `next_action.code: recover_custody`, and sets the command to exactly `no-mistakes axi sync --recover --keep-local`. That action leaves the worktree and local branch at `recovery.required_head`, leaves the divergent archive at `recovery.preserved_head`, and never merges, replays, fast-forwards, resets to, or otherwise selects the archived history. Running plain `--recover` against this plan refuses without adding an anchor or moving a ref.
 
 For the alternative validation path and its refusal conditions, see [`no-mistakes rerun`](#no-mistakes-rerun); it is not offered for the archive-backed keep-local plan.
-A recovered never-pushed run reports `state: custody_returned`; a recovered pushed run reports its ordinary classification against the last push binding, typically `local_ahead`.
+A recovered never-pushed run reports `state: custody_returned`. When the clean local branch is at or ahead of the run's verified adopted head and this rewrites the run's own last pushed commit, status reports `safety: pipeline_rewrite_pending` with `next_action.code: run_pipeline`. A live check still checks the configured push target for changes.
 On a `user_owned` branch, `--recover` is an idempotent no-op success: nothing pipeline-created exists to recover, and no file, ref, or database row changes.
 
 ## no-mistakes axi logs
@@ -867,6 +871,7 @@ no-mistakes sync --check
 no-mistakes sync --yes
 no-mistakes sync --recover
 no-mistakes sync --recover --keep-local
+no-mistakes sync --recover --take-pipeline
 no-mistakes sync --bind-archive-ref refs/heads/archive/<name>
 no-mistakes sync --adopt-published
 ```

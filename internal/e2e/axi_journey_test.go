@@ -611,22 +611,20 @@ func TestAxiTerminalEqualTreeRecoveryJourney(t *testing.T) {
 	}
 }
 
-// rebaseCustodyScenario differs from branchSyncScenario in exactly one way that
-// matters here: its fix round ADDS a file instead of rewriting the operator's
-// own line. Both shapes advance the gate branch, but only this one leaves the
-// operator's content intact in the preserved head, which is the case custody
-// recovery is allowed to adopt.
+// The review fix rewrites the operator's line after the rebase, so the
+// real CLI needs the recorded Review start to prove custody recovery.
 func rebaseCustodyScenario(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "rebase-custody-scenario.yaml")
 	content := `actions:
   - match: "Investigate previous review findings"
-    text: "added a guard helper"
+    text: "guarded the feature"
     edits:
-      - path: "guard.txt"
-        new: "guard helper\n"
+      - path: "feature.txt"
+        old: "unsafe"
+        new: "guarded"
     structured:
-      summary: "add a guard helper alongside the feature"
+      summary: "guard the feature"
   - match: "Review the code changes and return structured findings"
     text: "review found a warning"
     structured:
@@ -635,7 +633,7 @@ func rebaseCustodyScenario(t *testing.T) string {
           severity: warning
           file: "feature.txt"
           line: 1
-          description: "the feature needs a guard helper"
+          description: "the feature needs a guard"
           action: auto-fix
       summary: "found one issue"
       risk_level: medium
@@ -667,15 +665,9 @@ func rebaseCustodyScenario(t *testing.T) string {
 	return path
 }
 
-// TestAxiCustodyRecoveryAfterRebaseJourney is the same cancelled-validation
-// custody return, in the shape that used to over-escalate: the default branch
-// advanced before the run, so the pipeline's own rebase step replayed the
-// operator's commits onto the newer base. The preserved gate head then carries
-// the same logical work under different SHAs, which equality and ancestry alone
-// read as plain divergence - and recovery refused, stranding a branch that
-// could lose nothing by adopting the preserved head. The journey proves the
-// real binary now auto-recovers, keeps the operator's file content, brings the
-// advanced base into the worktree, and anchors the exact pre-recovery commits.
+// TestAxiCustodyRecoveryAfterRebaseJourney drives the real CLI through a
+// rebase, a fix that overwrites an operator line, cancellation, and a fresh
+// validation from the adopted head.
 func TestAxiCustodyRecoveryAfterRebaseJourney(t *testing.T) {
 	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: rebaseCustodyScenario(t)})
 	h.CommitChange("init-rebase-recover", "seed.txt", "seed\n", "seed rebase recover init")
@@ -698,10 +690,7 @@ func TestAxiCustodyRecoveryAfterRebaseJourney(t *testing.T) {
 	if err != nil || !strings.Contains(gateOut, "rebase-1") {
 		t.Fatalf("initial review gate: %v\n%s", err, gateOut)
 	}
-	// Take the fix round, which adds a file without rewriting the operator's
-	// line, then cancel. The preserved head is now the operator's own commits
-	// replayed onto the advanced base plus one additive pipeline commit, so it
-	// still carries every local change.
+	// Apply the review fix to the replayed operator line, then cancel.
 	fixOut, err := h.RunInDir(operator, "axi", "respond", "--action", "fix", "--findings", "rebase-1")
 	if err != nil {
 		t.Fatalf("review fix: %v\n%s", err, fixOut)
@@ -751,18 +740,20 @@ func TestAxiCustodyRecoveryAfterRebaseJourney(t *testing.T) {
 	if got, gitErr := h.runGit(context.Background(), operator, "rev-parse", "HEAD"); gitErr != nil || strings.TrimSpace(string(got)) != preserved {
 		t.Fatalf("operator HEAD after recovery = %s (err %v), want preserved %s", strings.TrimSpace(string(got)), gitErr, preserved)
 	}
-	// The operator's own work survived the adoption unchanged, the advanced
-	// base arrived with it, and the exact pre-recovery commits stay reachable
-	// through the local anchor.
 	feature, readErr := os.ReadFile(filepath.Join(operator, "feature.txt"))
-	if readErr != nil || strings.TrimSpace(string(feature)) != "unsafe" {
-		t.Fatalf("operator feature content lost after recovery: %q (err %v)", string(feature), readErr)
+	if readErr != nil || strings.TrimSpace(string(feature)) != "guarded" {
+		t.Fatalf("review fix missing after recovery: %q (err %v)", string(feature), readErr)
 	}
 	if _, statErr := os.Stat(filepath.Join(operator, "upstream-advance.txt")); statErr != nil {
 		t.Fatalf("adopted head did not bring the advanced base into the worktree: %v", statErr)
 	}
-	if _, statErr := os.Stat(filepath.Join(operator, "guard.txt")); statErr != nil {
-		t.Fatalf("adopted head did not bring the pipeline fix into the worktree: %v", statErr)
+	for ref, want := range map[string]string{
+		"refs/heads/feature/rebase-recover": preserved,
+		custody.RecoveryGateRef(run.ID):     submitted,
+	} {
+		if got, gitErr := h.runGit(context.Background(), gateDir, "rev-parse", ref); gitErr != nil || strings.TrimSpace(string(got)) != want {
+			t.Fatalf("mirror %s = %s (err %v), want %s", ref, got, gitErr, want)
+		}
 	}
 	if out, gitErr := h.runGit(context.Background(), operator, "status", "--porcelain"); gitErr != nil || strings.TrimSpace(string(out)) != "" {
 		t.Fatalf("worktree not clean after adoption: %q (err %v)", string(out), gitErr)

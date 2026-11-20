@@ -17,7 +17,7 @@ import (
 var syncInteractive = terminalInteractive
 
 func newSyncCmd() *cobra.Command {
-	var check, yes, recover, keepLocal, adoptPublished bool
+	var check, yes, recover, keepLocal, takePipeline, adoptPublished bool
 	var bindArchiveRef string
 	cmd := &cobra.Command{
 		Use:   "sync",
@@ -37,6 +37,8 @@ func newSyncCmd() *cobra.Command {
 			"(user_owned) and makes --recover a no-op. --recover --keep-local keeps the\n" +
 			"current local head and never touches the worktree; available preserved commits\n" +
 			"stay anchored, while genuinely missing preserved commits are discarded.\n" +
+			"--recover --take-pipeline explicitly adopts a pinned head after a recorded replay\n" +
+			"conflict, if the clean local branch is exactly at the submission or last push.\n" +
 			"--bind-archive-ref records one exact existing refs/heads/archive/* commit as\n" +
 			"evidence for the narrow keep-local recovery that stays at a required head while\n" +
 			"a divergent later head remains archived; it never creates or moves a Git ref.\n" +
@@ -54,14 +56,17 @@ func newSyncCmd() *cobra.Command {
 			if keepLocal && !recover {
 				return &exitError{code: 2, err: fmt.Errorf("--keep-local requires --recover")}
 			}
-			if bindArchiveRef != "" && (check || yes || recover || keepLocal || adoptPublished) {
+			if takePipeline && (!recover || keepLocal) {
+				return &exitError{code: 2, err: fmt.Errorf("--take-pipeline requires --recover and cannot be combined with --keep-local")}
+			}
+			if bindArchiveRef != "" && (check || yes || recover || keepLocal || takePipeline || adoptPublished) {
 				return &exitError{code: 2, err: fmt.Errorf("--bind-archive-ref cannot be combined with synchronization or recovery flags")}
 			}
 			if bindArchiveRef != "" {
 				return runHumanBindRecoveryArchive(cmd, bindArchiveRef)
 			}
 			if recover {
-				return runHumanRecover(cmd, keepLocal, yes)
+				return runHumanRecover(cmd, keepLocal, takePipeline, yes)
 			}
 			if adoptPublished {
 				return runHumanAdoptPublished(cmd, yes)
@@ -73,13 +78,14 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "apply an eligible guarded synchronization without prompting")
 	cmd.Flags().BoolVar(&recover, "recover", false, "return custody of a branch stranded by a terminal run with unpublished pipeline commits (a no-op when cancellation already released the branch), or rebind a terminal run's push binding to a verified rewritten remote head (recover_remote_rewritten)")
 	cmd.Flags().BoolVar(&keepLocal, "keep-local", false, "with --recover: keep the current local head; anchor available preserved commits, discard genuinely missing ones, and make the gate follow the kept head")
+	cmd.Flags().BoolVar(&takePipeline, "take-pipeline", false, "with --recover: explicitly take the verified pinned pipeline head after a replay conflict")
 	cmd.Flags().BoolVar(&adoptPublished, "adopt-published", false, "adopt a clean diverged local head into its stale gate lane only when the configured push target already has that exact head")
 	cmd.Flags().StringVar(&bindArchiveRef, "bind-archive-ref", "", "bind one existing refs/heads/archive/* commit as exact keep-local recovery evidence without changing Git refs")
 	return cmd
 }
 
 func newAxiSyncCmd() *cobra.Command {
-	var check, recover, keepLocal, adoptPublished bool
+	var check, recover, keepLocal, takePipeline, adoptPublished bool
 	var bindArchiveRef string
 	cmd := &cobra.Command{
 		Use:   "sync",
@@ -93,6 +99,7 @@ func newAxiSyncCmd() *cobra.Command {
 			"--check performs the same fresh read-only plan. Blocked states change nothing.\n" +
 			"--recover performs the guarded custody return offered by\n" +
 			"next_action.code: recover_custody; --keep-local keeps the current local head.\n" +
+			"When status offers --take-pipeline, it adopts the pinned head after a replay conflict.\n" +
 			"It also performs next_action.code: recover_remote_rewritten, which anchors the\n" +
 			"superseded pipeline head and rebinds the push binding to the re-verified live head.\n" +
 			"--bind-archive-ref binds one exact existing refs/heads/archive/* commit to\n" +
@@ -109,15 +116,19 @@ func newAxiSyncCmd() *cobra.Command {
 			if keepLocal && !recover {
 				return emitError(cmd, 2, "--keep-local requires --recover")
 			}
-			if bindArchiveRef != "" && (check || recover || keepLocal || adoptPublished) {
+			if takePipeline && (!recover || keepLocal) {
+				return emitError(cmd, 2, "--take-pipeline requires --recover and cannot be combined with --keep-local")
+			}
+			if bindArchiveRef != "" && (check || recover || keepLocal || takePipeline || adoptPublished) {
 				return emitError(cmd, 2, "--bind-archive-ref cannot be combined with synchronization or recovery flags")
 			}
-			return runAxiSync(cmd, check, recover, keepLocal, adoptPublished, bindArchiveRef)
+			return runAxiSync(cmd, check, recover, keepLocal, takePipeline, adoptPublished, bindArchiveRef)
 		},
 	}
 	cmd.Flags().BoolVar(&check, "check", false, "freshly verify and return the plan without changing HEAD")
 	cmd.Flags().BoolVar(&recover, "recover", false, "return custody of a branch stranded by a terminal run with unpublished pipeline commits (a no-op when cancellation already released the branch), or rebind a terminal run's push binding to a verified rewritten remote head (recover_remote_rewritten)")
 	cmd.Flags().BoolVar(&keepLocal, "keep-local", false, "with --recover: keep the current local head; anchor available preserved commits, discard genuinely missing ones, and make the gate follow the kept head")
+	cmd.Flags().BoolVar(&takePipeline, "take-pipeline", false, "with --recover: explicitly take the verified pinned pipeline head after a replay conflict")
 	cmd.Flags().BoolVar(&adoptPublished, "adopt-published", false, "adopt a clean diverged local head into its stale gate lane only when the configured push target already has that exact head")
 	cmd.Flags().StringVar(&bindArchiveRef, "bind-archive-ref", "", "bind one existing refs/heads/archive/* commit as exact keep-local recovery evidence without changing Git refs")
 	return cmd
@@ -242,11 +253,13 @@ func runHumanBindRecoveryArchive(cmd *cobra.Command, archiveRef string) error {
 	return &exitError{code: 1}
 }
 
-func runHumanRecover(cmd *cobra.Command, keepLocal, yes bool) error {
+func runHumanRecover(cmd *cobra.Command, keepLocal, takePipeline, yes bool) error {
 	started := time.Now()
 	mode := "recover"
 	if keepLocal {
 		mode = "recover_keep_local"
+	} else if takePipeline {
+		mode = "recover_take_pipeline"
 	}
 	var observed branchsync.State
 	result := "error"
@@ -268,6 +281,8 @@ func runHumanRecover(cmd *cobra.Command, keepLocal, yes bool) error {
 			retry := "no-mistakes sync --recover --yes"
 			if keepLocal {
 				retry = "no-mistakes sync --recover --keep-local --yes"
+			} else if takePipeline {
+				retry = "no-mistakes sync --recover --take-pipeline --yes"
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "  Non-interactive input cannot confirm this recovery. Re-run with `%s`.\n", retry)
 			result = "refused"
@@ -287,6 +302,9 @@ func runHumanRecover(cmd *cobra.Command, keepLocal, yes bool) error {
 				fmt.Fprintln(cmd.OutOrStdout(), "  genuinely missing ones, and moving the local gate branch to your current head;")
 				fmt.Fprintln(cmd.OutOrStdout(), "  the worktree is never touched.")
 			}
+		} else if takePipeline {
+			fmt.Fprintln(cmd.OutOrStdout(), "  Recovery adopts the pinned pipeline head, including its versions of the listed paths.")
+			fmt.Fprintln(cmd.OutOrStdout(), "  Your current commit is anchored before moving the branch.")
 		} else {
 			fmt.Fprintln(cmd.OutOrStdout(), "  Recovery may return custody from the terminal run. The possible worktree")
 			fmt.Fprintln(cmd.OutOrStdout(), "  change is a fast-forward of this clean behind branch, or")
@@ -313,7 +331,12 @@ func runHumanRecover(cmd *cobra.Command, keepLocal, yes bool) error {
 		}
 	}
 
-	recovered := service.Recover(cmd.Context(), keepLocal)
+	var recovered branchsync.State
+	if takePipeline {
+		recovered = service.RecoverTakePipeline(cmd.Context())
+	} else {
+		recovered = service.Recover(cmd.Context(), keepLocal)
+	}
 	observed = recovered
 	printHumanSyncState(cmd, recovered)
 	if recovered.Recovered {
@@ -405,6 +428,12 @@ func printHumanSyncState(cmd *cobra.Command, state branchsync.State) {
 }
 
 func humanSyncSummary(state branchsync.State) string {
+	if state.Safety == branchsync.SafetyPipelineRewritePending {
+		return "the recovered pipeline rewrite is ready for a fresh run"
+	}
+	if state.TakePipeline != nil {
+		return "recorded replay conflicts require choosing --recover --keep-local or --recover --take-pipeline"
+	}
 	if state.Safety == "blocked_cancelled_published_recoverable" {
 		return "the cancelled pipeline head is contained locally; recover custody with `no-mistakes sync --recover` to continue on the same branch"
 	}
@@ -461,7 +490,7 @@ func humanSyncSummary(state branchsync.State) string {
 	}
 }
 
-func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, adoptPublished bool, bindArchiveRef string) error {
+func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, takePipeline, adoptPublished bool, bindArchiveRef string) error {
 	started := time.Now()
 	mode := "apply"
 	switch {
@@ -469,6 +498,8 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, adoptPublished bo
 		mode = "bind_archive"
 	case check:
 		mode = "check"
+	case takePipeline:
+		mode = "recover_take_pipeline"
 	case recover && keepLocal:
 		mode = "recover_keep_local"
 	case recover:
@@ -491,6 +522,8 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, adoptPublished bo
 		state = service.BindRecoveryArchive(cmd.Context(), bindArchiveRef)
 	case check:
 		state = service.Refresh(cmd.Context())
+	case takePipeline:
+		state = service.RecoverTakePipeline(cmd.Context())
 	case recover:
 		state = service.Recover(cmd.Context(), keepLocal)
 	case adoptPublished:
@@ -509,6 +542,9 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, adoptPublished bo
 	var help []string
 	if state.NextAction != nil {
 		help = append(help, "Run `"+state.NextAction.Command+"`")
+	}
+	if state.TakePipeline != nil {
+		help = append(help, "Run "+state.TakePipeline.Command+" to adopt the pinned pipeline head with its conflict resolutions")
 	}
 	if state.Safety == "blocked_pipeline_owned_recoverable" && (state.Recovery == nil || !state.Recovery.KeepLocal) {
 		help = append(help, "Run `no-mistakes rerun` instead to resume validating the selected preserved pipeline head; it refuses a known clean caller HEAD mismatch. If heads differ, inspect `no-mistakes axi status` and follow its exact `branch_sync.next_action.command` for custody or synchronization, then submit intended local commits with a fresh `no-mistakes axi run` once custody permits")
@@ -668,6 +704,15 @@ func branchSyncField(state branchsync.State) toON.Field {
 			toON.Field{Key: "code", Value: state.NextAction.Code},
 			toON.Field{Key: "command", Value: state.NextAction.Command},
 		)})
+	}
+	if state.TakePipeline != nil {
+		fields = append(fields,
+			toON.Field{Key: "take_pipeline", Value: toON.NewObject(
+				toON.Field{Key: "code", Value: state.TakePipeline.Code},
+				toON.Field{Key: "command", Value: state.TakePipeline.Command},
+			)},
+			toON.Field{Key: "replay_conflicts", Value: state.ReplayConflicts},
+		)
 	}
 	return toON.Field{Key: "branch_sync", Value: toON.NewObject(fields...)}
 }

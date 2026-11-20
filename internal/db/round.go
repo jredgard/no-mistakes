@@ -317,3 +317,30 @@ func (d *DB) GetRoundsByStep(stepResultID string) ([]*StepRound, error) {
 	}
 	return rounds, rows.Err()
 }
+
+// ReviewStart records the commit at entry to one Review round of a run.
+type ReviewStart struct {
+	Head    string
+	Initial bool
+}
+
+func (d *DB) ReviewStarts(runID string) ([]ReviewStart, error) {
+	rows, err := d.sql.Query(`
+		SELECT r.starting_head_sha, r.trigger_type
+		FROM step_rounds r JOIN step_results s ON s.id = r.step_result_id
+		WHERE s.run_id = ? AND s.step_name = ? AND r.starting_head_sha IS NOT NULL
+		ORDER BY r.round DESC`, runID, types.StepReview)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var starts []ReviewStart
+	for rows.Next() {
+		var head, trigger string
+		if err := rows.Scan(&head, &trigger); err != nil {
+			return nil, err
+		}
+		starts = append(starts, ReviewStart{Head: head, Initial: trigger == "initial"})
+	}
+	return starts, rows.Err()
+}

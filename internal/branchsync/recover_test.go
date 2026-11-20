@@ -2937,6 +2937,7 @@ func TestRecoverSquashedPreservedHeadStillEscalatesForDroppedLocalWork(t *testin
 	t.Parallel()
 
 	f := newRebasedRecoverFixture(t, types.RunCancelled)
+	recordReviewStarts(t, f, f.preserved)
 	pipeline := filepath.Join(filepath.Dir(f.local), "squash-drop")
 	mustRun(t, filepath.Dir(f.local), "-c", "core.autocrlf=false", "clone", f.gate, pipeline)
 	mustRun(t, pipeline, "checkout", "feature/recover")

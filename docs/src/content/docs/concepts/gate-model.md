@@ -146,6 +146,14 @@ is still the head archived before the mirror ref is removed.
 If survival cannot be proven, the whole private-only range is reported as at
 risk.
 
+Diverged custody adoption can use a recorded Review start to prove that
+local changes survived the replay before later fixes. It pins the old mirror
+head under `refs/no-mistakes/recover-gate/<run>` before using a compare-and-swap
+to move the lane to the preserved head. A subsequent submission descended
+from that head is a mirror fast-forward. The operator's pre-recovery commit
+stays under `refs/no-mistakes/recover-local/<run>`. Recovery never pushes.
+See [Custody recovery](/no-mistakes/reference/cli/#custody-recovery).
+
 **Recovery-anchor preservation credit (issue #1233):** a private-only commit
 that a `refs/no-mistakes/recover/<run>` or
 `refs/no-mistakes/recover-rewritten/<run>/<generation>` anchor reaches is
